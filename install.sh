@@ -997,23 +997,6 @@ get_latest_version() {
     rm -f "$_tmpfile"
 }
 
-            local _tmpfile=$(mktemp)
-
-            if ! download_hysteria "$VERSION" "$_tmpfile"; then
-                rm -f "$_tmpfile"
-                exit 11
-            fi
-
-            echo -ne "กำลังติดตั้งไฟล์ Hysteria ... "
-
-            if install -Dm755 "$_tmpfile" "$EXECUTABLE_INSTALL_PATH"; then
-                echo "สำเร็จ"
-            else
-                exit 13
-            fi
-
-            rm -f "$_tmpfile"
-        }
 
         perform_remove_hysteria_binary() {
             remove_file "$EXECUTABLE_INSTALL_PATH"
