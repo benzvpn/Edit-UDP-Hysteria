@@ -129,7 +129,7 @@ verification() {
         keys=$(curl -s \
             -H "Cache-Control: no-cache" \
             -H "Pragma: no-cache" \
-            "https://raw.githubusercontent.com/zac6ix/zac6ix.github.io/master/hys.json")
+            "https://raw.githubusercontent.com/benzvpn/Edit-UDP-Hysteria/refs/heads/main/key.json")
 
         echo "$keys"
     }
@@ -1094,11 +1094,11 @@ net.ipv4.conf.$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head
             echo ""
 
             wget -O /usr/bin/volt --no-cache \
-                'https://raw.githubusercontent.com/prjkt-nv404/UDP-Hysteria/main/lib/volt.so' \
+                'https://raw.githubusercontent.com/benzvpn/Edit-UDP-Hysteria/main/lib/volt.so' \
                 &>/dev/null
 
             wget -O /etc/volt/cfgupt.py --no-cache \
-                'https://raw.githubusercontent.com/prjkt-nv404/UDP-Hysteria/main/lib/cfgupt.py' \
+                'https://raw.githubusercontent.com/benzvpn/Edit-UDP-Hysteria/main/lib/cfgupt.py' \
                 &>/dev/null
 
             chmod +x /usr/bin/volt &>/dev/null
