@@ -111,7 +111,7 @@ udph
 
 ประวัติการเปลี่ยนแปลง
 <details class="details" style="border: 1px solid #ccc; padding: 10px; margin-bottom: 10px;">
-  <summary style="cursor: pointer;">🔨 Commit ใหม่: ปรับปรุงระบบ (<a href="https://github.com/benzvpn/Edit-UDP-Hysteria" target="_blank">...เพื้อศึกษา</a>) สำหรับ UDP-Hysteria[Public]:main</summary>
+  <summary style="cursor: pointer;">🔨 Commit ใหม่: ปรับปรุงระบบ (<a href="https://github.com/benzvpn/Edit-UDP-Hysteria" target="_blank"></a>) สำหรับ UDP-Hysteria[Public]:main</summary>
   <ul>
     <li><strong>[ปรับปรุง]</strong> ปรับปรุงโค้ดโดยรวม</li>
     <li><strong>[อัปเดต]</strong> อัปเดตระบบ Hysteria Config Updater</li>
