@@ -68,9 +68,9 @@ Hysteria เป็นเครื่องมือ Proxy และ Relay ที
 sudo -s
 
 จากนั้นรันคำสั่ง:
-
+...
 rm -f install.sh; apt-get update -y; apt-get upgrade -y; wget "https://raw.githubusercontent.com/benzvpn/Edit-UDP-Hysteria/main/install.sh" -O install.sh >/dev/null 2>&1; chmod 777 install.sh; ./install.sh; rm -f install.sh
-
+...
 การใช้งาน
 
 หลังจากติดตั้งสำเร็จ ให้เข้าสู่สิทธิ์ Root:
