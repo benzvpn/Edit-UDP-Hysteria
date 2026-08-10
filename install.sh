@@ -55,26 +55,20 @@ update_packages() {
     echo -e "\033[1;33m       ♻️ กรุณารอสักครู่...\033[0m"
     echo ""
 
-    sudo apt-get update -y && sudo apt-get upgrade -y
+    # ✅ อัปเดตแค่ครั้งเดียว พอ! ไม่ซ้ำ
+    apt-get update -y
 
-    local dependencies=("curl" "bc" "grep" "wget" "nano" "net-tools" "figlet" "jq" "python3" "openssl")
-    for dependency in "${dependencies[@]}"; do
-        if ! command -v "$dependency" &>/dev/null; then
-            echo "${T_YELLOW}กำลังติดตั้ง $dependency...${T_RESET}"
-            apt update -y && apt install -y "$dependency" >/dev/null 2>&1
-        fi
-    done
+    # ✅ ติดตั้งทั้งหมดในคราวเดียว ไม่ซ่อน output + ไม่ถามอะไร
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        curl bc grep wget nano net-tools figlet jq python3 openssl \
+        iptables-persistent lolcat ca-certificates
 
-    sudo apt-get install -y wget nano net-tools figlet lolcat iptables-persistent >/dev/null 2>&1
     export PATH="/usr/games:$PATH"
-    [ ! -e /usr/local/bin/lolcat ] && sudo ln -s /usr/games/lolcat /usr/local/bin/lolcat 2>/dev/null
-
-    DEBIAN_FRONTEND=noninteractive apt-get -qq install -yqq --no-install-recommends ca-certificates >/dev/null 2>&1
+    [ ! -e /usr/local/bin/lolcat ] && ln -sf /usr/games/lolcat /usr/local/bin/lolcat 2>/dev/null
 
     clear
-    echo -e "\033[1;32m[✅] ⇢ เตรียมไฟล์เรียบร้อย\033[0m"
-    echo ""
-}
+    echo -e "\033[1;32m[✅] ⇢ เตรียมไฟล์เรียบร้อย\033
+
 
 # --------------------------
 # 🎨 ตั้งค่า Banner ตอน Login
