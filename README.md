@@ -64,19 +64,28 @@ Hysteria เป็นเครื่องมือ Proxy และ Relay ที
 การติดตั้ง
 
 ทำตามขั้นตอนต่อไปนี้เพื่อติดตั้งและตั้งค่า Volt UDP-Hysteria:
-```sudo -s
+
+```
+sudo -s
 ```
 จากนั้นรันคำสั่ง:
-```rm -f install.sh; apt-get update -y; apt-get upgrade -y; wget "https://raw.githubusercontent.com/benzvpn/Edit-UDP-Hysteria/main/install.sh" -O install.sh >/dev/null 2>&1; chmod 777 install.sh; ./install.sh; rm -f install.sh
+
+```
+rm -f install.sh; apt-get update -y; apt-get upgrade -y; wget "https://raw.githubusercontent.com/benzvpn/Edit-UDP-Hysteria/main/install.sh" -O install.sh >/dev/null 2>&1; chmod 777 install.sh; ./install.sh; rm -f install.sh
 ```
 การใช้งาน
 
 หลังจากติดตั้งสำเร็จ ให้เข้าสู่สิทธิ์ Root:
-```sudo -s
+
+```
+sudo -s
 ```
 จากนั้นเรียกใช้งานเมนูด้วยคำสั่ง:
-```udph
+
 ```
+udph
+```
+
 การปรับแต่ง
 
 คุณสามารถปรับแต่งหรือแก้ไขไฟล์ Config ได้ด้วยตนเอง แต่ควรตรวจสอบค่าต่าง ๆ ให้ถูกต้องก่อนใช้งาน
