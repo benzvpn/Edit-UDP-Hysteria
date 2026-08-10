@@ -88,7 +88,8 @@ udph
 การปรับแต่ง
 
 คุณสามารถปรับแต่งหรือแก้ไขไฟล์ Config ได้ด้วยตนเอง แต่ควรตรวจสอบค่าต่าง ๆ ให้ถูกต้องก่อนใช้งาน
-```
+
+```json
 {
   "listen": ":$UDP_PORT",
   "protocol": "$PROTOCOL",
@@ -106,6 +107,7 @@ udph
   }
 }
 ```
+
 ประวัติการเปลี่ยนแปลง
 <details class="details" style="border: 1px solid #ccc; padding: 10px; margin-bottom: 10px;">
   <summary style="cursor: pointer;">🔨 Commit ใหม่: ปรับปรุงระบบ (<a href="https://github.com/benzvpn/Edit-UDP-Hysteria" target="_blank">...เพื้อศึกษา</a>) สำหรับ UDP-Hysteria[Public]:main</summary>
