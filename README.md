@@ -21,6 +21,7 @@ Hysteria เป็นเครื่องมือ Proxy และ Relay ที
 "⚠️ ข้อจำกัดความรับผิดชอบ ⚠️" (#️-ข้อจำกัดความรับผิดชอบ-️)| คำเตือนและข้อควรระวัง
 
 คุณสมบัติ
+
 ```
 - ช่วยเพิ่มประสิทธิภาพการเชื่อมต่อที่มีการสูญหายของแพ็กเก็ตหรือไม่เสถียร
 - ช่วยหลีกเลี่ยงข้อจำกัดของเครือข่ายในบางสภาพแวดล้อม
@@ -106,7 +107,6 @@ udph
 }
 ```
 ประวัติการเปลี่ยนแปลง
----
 <details class="details" style="border: 1px solid #ccc; padding: 10px; margin-bottom: 10px;">
   <summary style="cursor: pointer;">🔨 Commit ใหม่: ปรับปรุงระบบ (<a href="https://github.com/benzvpn/Edit-UDP-Hysteria" target="_blank">...เพื้อศึกษา</a>) สำหรับ UDP-Hysteria[Public]:main</summary>
   <ul>
@@ -117,7 +117,7 @@ udph
     <li><strong>[แก้ไข]</strong> แก้ไขระบบ Cache และการจัดเก็บ Domain</li>
   </ul>
 </details>
----
+
 
 ⚠️ ข้อจำกัดความรับผิดชอบ ⚠️
 ```
@@ -127,8 +127,6 @@ Hysteria เป็นโครงการของ Aperture Internet Laboratory
 เครดิต
 ```
 «"Aperture Internet Laboratory" (https://github.com/apernet)
-
 - เจ้าของ Binary ทั้งหมด»
-
 «"สร้างด้วย 🤍 จาก กระดอถอกใช้ไปเหอะ"»
 ```
