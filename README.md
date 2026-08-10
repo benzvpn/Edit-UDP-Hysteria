@@ -22,8 +22,7 @@ Hysteria เป็นเครื่องมือ Proxy และ Relay ที
 
 คุณสมบัติ
 
-```
-- ช่วยเพิ่มประสิทธิภาพการเชื่อมต่อที่มีการสูญหายของแพ็กเก็ตหรือไม่เสถียร
+```- ช่วยเพิ่มประสิทธิภาพการเชื่อมต่อที่มีการสูญหายของแพ็กเก็ตหรือไม่เสถียร
 - ช่วยหลีกเลี่ยงข้อจำกัดของเครือข่ายในบางสภาพแวดล้อม
 - เพิ่มประสิทธิภาพการรับส่งข้อมูลบนเครือข่ายที่มีความหนาแน่นสูง
 - รองรับการใช้งานในเครือข่ายที่มี Firewall
@@ -33,8 +32,7 @@ Hysteria เป็นเครื่องมือ Proxy และ Relay ที
 ...
 
 การใช้งาน
-```
-- ใช้สำหรับการเชื่อมต่อเครือข่ายในสภาพแวดล้อมที่มีข้อจำกัด
+```- ใช้สำหรับการเชื่อมต่อเครือข่ายในสภาพแวดล้อมที่มีข้อจำกัด
 - ช่วยปรับปรุงความเร็วในการเชื่อมต่อบนเครือข่ายที่ช้าหรือมีผู้ใช้งานหนาแน่น
 - ใช้แก้ไขปัญหาการเชื่อมต่อในบางภูมิภาคที่มีสภาพเครือข่ายไม่เสถียร
 - ใช้สำหรับเชื่อมต่อบริการที่อยู่หลัง Firewall
@@ -42,8 +40,7 @@ Hysteria เป็นเครื่องมือ Proxy และ Relay ที
 ...
 
 โหมดการทำงาน
-```
-- SOCKS5 Proxy สำหรับทราฟฟิก TCP และ UDP
+```- SOCKS5 Proxy สำหรับทราฟฟิก TCP และ UDP
 - HTTP/HTTPS Proxy สำหรับการรับส่งข้อมูลเว็บ
 - TCP/UDP Relay สำหรับส่งต่อแพ็กเก็ตเครือข่าย
 - TCP TPROXY และ TCP REDIRECT บน Linux
@@ -60,30 +57,25 @@ Hysteria เป็นเครื่องมือ Proxy และ Relay ที
 - IDC ✅
 
 ข้อกำหนด
-```
-- ระบบ Linux ที่ทำงานบน "VPS"
+```- ระบบ Linux ที่ทำงานบน "VPS"
 - Domain เช่น "hysteria.Domain.COM" (สามารถรับ Domain ฟรีได้จาก "https://duckdns.org")
 - ความเข้าใจพื้นฐานในการใช้งาน Linux
 ```
 การติดตั้ง
 
 ทำตามขั้นตอนต่อไปนี้เพื่อติดตั้งและตั้งค่า Volt UDP-Hysteria:
-```
-sudo -s
+```sudo -s
 ```
 จากนั้นรันคำสั่ง:
-```
-rm -f install.sh; apt-get update -y; apt-get upgrade -y; wget "https://raw.githubusercontent.com/benzvpn/Edit-UDP-Hysteria/main/install.sh" -O install.sh >/dev/null 2>&1; chmod 777 install.sh; ./install.sh; rm -f install.sh
+```rm -f install.sh; apt-get update -y; apt-get upgrade -y; wget "https://raw.githubusercontent.com/benzvpn/Edit-UDP-Hysteria/main/install.sh" -O install.sh >/dev/null 2>&1; chmod 777 install.sh; ./install.sh; rm -f install.sh
 ```
 การใช้งาน
 
 หลังจากติดตั้งสำเร็จ ให้เข้าสู่สิทธิ์ Root:
-```
-sudo -s
+```sudo -s
 ```
 จากนั้นเรียกใช้งานเมนูด้วยคำสั่ง:
-```
-udph
+```udph
 ```
 การปรับแต่ง
 
