@@ -1,0 +1,374 @@
+clear
+
+export GREEN='\e[32m'
+export RED='\033[0;31m'
+export BGBLUE='\e[1;44m'
+export ORANGE='\033[0;33m'
+export BLUE='\033[0;34m'
+export PURPLE='\033[0;35m'
+export CYAN='\033[0;36m'
+export BG='\E[44;1;39m'
+export NC='\033[0;37m'
+export WHITE='\033[0;37m'
+export TRY="[${RED} * ${NC}]"
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+install_dependencies() {
+    if ! command_exists figlet; then
+        echo "กำลังติดตั้ง figlet..."
+        sudo apt-get update
+        sudo apt-get install -y figlet
+    fi
+
+    if ! command_exists lolcat; then
+        echo "กำลังติดตั้ง lolcat..."
+        sudo apt-get update
+        sudo apt-get install -y lolcat
+        export PATH="/usr/games:$PATH"
+
+        if [ ! -e /usr/local/bin/lolcat ]; then
+            sudo ln -s /usr/games/lolcat /usr/local/bin/lolcat
+        fi
+    fi
+}
+
+reboot() {
+    clear
+    echo -e "${GREEN}ระบบจะรีบูตภายใน 3 วินาที...${NC}"
+    sleep 3
+    echo ""
+    echo -e "${RED}กำลังรีบูต...${NC}"
+    sudo reboot
+}
+
+restart_services() {
+    GREEN="\033[0;32m"
+    RED="\033[0;31m"
+    RESET="\033[0m"
+
+    sudo systemctl restart hysteria
+
+    if systemctl is-active hysteria >/dev/null; then
+        echo -e "บริการ Hysteria ${GREEN}ทำงานอยู่${RESET}"
+    else
+        echo -e "บริการ Hysteria ${RED}ไม่ได้ทำงาน${RESET}"
+    fi
+
+    if systemctl is-enabled hysteria >/dev/null; then
+        echo -e "บริการ Hysteria ${GREEN}เปิดใช้งานอัตโนมัติแล้ว${RESET}"
+    else
+        echo -e "บริการ Hysteria ${RED}ยังไม่ได้เปิดใช้งานอัตโนมัติ${RESET}"
+    fi
+
+    read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
+    menu
+}
+
+new_auth() {
+    clear
+
+    if command_exists figlet && command_exists lolcat; then
+        figlet -k Voltssh-X | lolcat
+        figlet -k Hysteria | lolcat
+    else
+        echo "กรุณาติดตั้ง 'figlet' และ 'lolcat' เพื่อการแสดงผลที่สวยงาม"
+    fi
+
+    echo -e "${BLUE}┌──────────────────────────────────────────────────────•${NC}"
+    echo -e "${BLUE}• รายการ ⤵⤵ •${NC}  ${BLUE}•${NC} เพิ่มรหัสผ่านสำหรับ Auth ${NC}"
+    echo -e "${BLUE}•──────────────────────────────────────────────────────•${NC}"
+    echo -e "${RED}หมายเหตุ: คุณสามารถเพิ่มรหัสผ่าน Auth ใหม่เพื่อใช้เป็นบัญชีได้${NC}"
+    echo -e "${GREEN}    - สามารถเปลี่ยนรหัสผ่าน Auth ได้ที่ '/etc/hysteria/config.json'${NC}"
+    echo -e "${ORANGE}    - OBFS เป็นค่าคงที่ สามารถเปลี่ยนได้ที่ '/etc/hysteria/config.json'${NC}"
+    echo ""
+    echo ""
+    echo -e "${CYAN}OBFS : $(cat /etc/volt/OBFS) ${RESET}"
+    echo ""
+
+    python3 /etc/volt/cfgupt.py
+    systemctl restart hysteria
+
+    read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
+    menu
+}
+
+list_auth() {
+    clear
+
+    BLUE='\033[1;34m'
+    NC='\033[0m'
+
+    json_file="/etc/hysteria/config.json"
+
+    if ! command -v jq &>/dev/null; then
+        echo "ข้อผิดพลาด: ไม่พบ jq กรุณาติดตั้งด้วยตัวจัดการแพ็กเกจของระบบ"
+        exit 1
+    fi
+
+    passwords=$(jq -r '.auth.config[]' "$json_file")
+
+    if [[ -n "$passwords" ]]; then
+
+        if command_exists figlet && command_exists lolcat; then
+            figlet -k Voltssh-X | lolcat
+            figlet -k Hysteria | lolcat
+        else
+            echo "กรุณาติดตั้ง 'figlet' และ 'lolcat' เพื่อการแสดงผลที่สวยงาม"
+        fi
+
+        echo -e "${BLUE}┌────────────────────────────────────────────────────────────────•${NC}"
+        echo -e "${BLUE}• รายการ ⤵⤵ •${NC}  ${BLUE}•${NC} รหัสผ่าน Auth ${NC}"
+        echo -e "${BLUE}•────────────────────────────────────────────────────────────────•${NC}"
+
+        IFS=$'\n'
+
+        for password in $passwords; do
+            echo -e "${BLUE}• ${password}"
+        done
+
+        echo -e "${BLUE}•────────────────────────────────────────────────────────────────•${NC}"
+
+    else
+        echo "ไม่พบรหัสผ่านในระบบ"
+    fi
+
+    echo ""
+    read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
+    menu
+}
+
+vps_info() {
+    clear
+
+    install_dependencies
+
+    DESCRIPTION=$(lsb_release -sd)
+    CODENAME=$(lsb_release -sc)
+    KERNEL=$(uname -r)
+    COUNTRY=$(curl -s "https://ipinfo.io/city")
+    PUBLIC_IP=$(curl -s https://api.ipify.org)
+    ORG=$(curl -s "https://ipinfo.io/org")
+
+    if command_exists figlet && command_exists lolcat; then
+        figlet -k Voltssh-X | lolcat
+        figlet -k Hysteria | lolcat
+    else
+        echo "กรุณาติดตั้ง 'figlet' และ 'lolcat' เพื่อการแสดงผลที่สวยงาม"
+    fi
+
+    echo -e "$BLUE•──────────────────────────────────────────────•$NC"
+    echo -e "$BLUE│$NC       •• ข้อมูล VPS ••  $NC"
+    echo -e "$BLUE└──────────────────────────────────────────────┘$NC"
+
+    echo -e "$BLUE┌──────────────────────────────────────────────┐$NC"
+    echo -e "$BLUE│$NC IP : $PUBLIC_IP"
+    echo -e "$BLUE│$NC ประเทศ : $COUNTRY"
+    echo -e "$BLUE│$NC ผู้ให้บริการ : $ORG"
+    echo -e "$BLUE│$NC ระบบปฏิบัติการ : $DESCRIPTION"
+    echo -e "$BLUE│$NC Codename : $CODENAME"
+    echo -e "$BLUE│$NC Kernel : $KERNEL"
+    echo -e "$BLUE└──────────────────────────────────────────────┘$NC"
+
+    echo -e "$BLUE•──────────────────────────────────────────────•$NC"
+    echo ""
+
+    read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
+    menu
+}
+
+hys_uninstaller() {
+    clear
+
+    figlet -k Voltssh-X | lolcat
+    figlet -k Hysteria | lolcat
+
+    echo ""
+    echo -e "\033[1;32m     โปรแกรมถอนการติดตั้ง!\033[1;33m"
+    echo -e "$BLUE•──────────────────────────────────────────•$NC"
+
+    read -p "ต้องการดำเนินการถอนการติดตั้งหรือไม่? [Y/n] " resp
+
+    if [[ "$resp" = y || "$resp" = Y ]]; then
+
+        echo ""
+        echo -e " \e[1;33mขอให้คุณโชคดีต่อไป! 💙\033[0m"
+        echo ""
+        echo -e " \e[1;33mสามารถส่งความคิดเห็นของคุณได้ที่:\033[0m"
+        echo -e " \e[1;33m[ 👨🏽‍💻 ผู้จัดทำ: Thongjuea ]\033[0m"
+        echo -e " \033[92m⇢ facebook : Thongjuea Permsap\033[0m"
+        echo ""
+        echo -e " \033[92m⇢ แจ้งเตือน: เซิร์ฟเวอร์อาจถูกตัดการเชื่อมต่อ!\033[0m"
+
+        sleep 5
+
+        apt-get purge screen -y >/dev/null 2>&1
+        apt-get purge nmap -y >/dev/null 2>&1
+        apt-get purge dropbear -y >/dev/null 2>&1
+        apt-get purge apache2 -y >/dev/null 2>&1
+
+        systemctl stop hysteria &>/dev/null
+        systemctl disable hysteria &>/dev/null
+
+        rm -f /etc/systemd/system/hysteria.service &>/dev/null
+        rm -rf /etc/volt/hy1 &>/dev/null
+        rm -rf /etc/hysteria &>/dev/null
+
+        sudo systemctl stop hysteria-server &>/dev/null
+        systemctl disable hysteria-server &>/dev/null
+
+        rm -f /etc/systemd/system/hysteria-server.service &>/dev/null
+        rm -f /etc/systemd/system/multi-user.target.wants/hysteria-server.service &>/dev/null
+        rm -f /etc/systemd/system/multi-user.target.wants/hysteria-server@*.service &>/dev/null
+
+        systemctl daemon-reload &>/dev/null
+
+        sudo rm -rf /etc/hysteria &>/dev/null
+        sudo rm -rf /etc/volt &>/dev/null
+
+        rm -f /etc/systemd/system/hysteria-server.service &>/dev/null
+        rm -rf /etc/volt/hy2 &>/dev/null
+        rm -rf /etc/hysteria &>/dev/null
+        rm -rf /root/hy &>/dev/null
+
+        remove_n_purge() {
+            sudo apt-get remove --purge -y \
+                apache2 \
+                dropbear \
+                dos2unix \
+                nload \
+                jq \
+                lolcat \
+                figlet \
+                screen \
+                nodejs \
+                npm \
+                iptables > /dev/null 2>&1
+        }
+
+        remove_n_purge
+
+        rm -rf /etc/volt >/dev/null 2>&1
+
+        sed -i '/figlet -k Voltssh-X | lolcat/,/echo -e ""/d' ~/.bashrc
+        sed -i '/figlet -k Hsyteria | lolcat/,/echo -e ""/d' ~/.bashrc
+
+        pkill -9 screen >/dev/null 2>&1
+
+        echo -e "\033[1;36mถอนการติดตั้งสำเร็จ!\033[1;33m"
+        echo ""
+
+        echo -e "อ่านข้อมูลนี้! (5 วินาที)"
+        echo -e "\033[1;36mหากเมนูยังคงแสดงอยู่ ให้กด Ctrl+C เพื่อบังคับออก\033[1;33m"
+        echo -e "\033[1;36mไม่ใช่ข้อผิดพลาดแต่อย่างใด!\033[1;33m"
+
+        sleep 5
+        exit
+
+    else
+
+        echo -e "\033[1;32mคุณไม่ได้ถอนการติดตั้ง\033[1;33m"
+        echo -e "\033[1;32mกำลังกลับไปยังเมนู...\033[0;37m"
+
+        sleep 2
+        menu
+    fi
+}
+
+menu() {
+    clear
+
+    UDP_PORT_HP=$(cat /etc/volt/UDP_PORT_HP)
+    RmtPORT=36712
+
+    if [[ $(systemctl is-active hysteria) == 'active' ]]; then
+        state_hysteria="\e[1m\e[32m[เปิดใช้งาน]"
+    else
+        state_hysteria="\e[1m\e[31m[ปิดใช้งาน]"
+    fi
+
+    figlet -k Voltssh-X Hysteria | lolcat
+
+    echo -e "$BLUE┌────────────────────────────────────────────────────────────────•${NC}"
+    echo -e "$BLUE│$NC ${ORANGE}•${NC} เวอร์ชัน: ${BLUE}voltx 1.3.5${NC}      ${BLUE}•${NC} IP: $(curl -sS ipv4.icanhazip.com)"
+    echo -e "$BLUE│$NC ${ORANGE}•${NC} ช่อง TG: ${BLUE}@lstunnels${NC}    ${BLUE}•${NC} โดเมน: $(cat /etc/volt/DOMAIN)"
+    echo -e "$BLUE│$NC ${ORANGE}•${NC} DevChat: ${BLUE}@voltsshx${NC}        ${BLUE}•${NC} Uptime: $(uptime -p | sed 's/up //')"
+    echo -e "$BLUE└────────────────────────────────────────────────────────────────•${NC}"
+
+    echo -e "$BLUE┌────────────────────────────────────────────────────────────────•$NC"
+    echo -e "$BLUE│$NC  โปรโตคอล : [$(cat /etc/volt/PROTOCOL)]    ${BLUE}•${NC} พอร์ต UDP : ${RmtPORT}, ${UDP_PORT_HP} $NC"
+    echo -e "$BLUE└────────────────────────────────────────────────────────────────•$NC"
+
+    echo -e "$BLUE┌────────────────────────────────────────────────────────────────•$NC"
+    echo -e "$BLUE• ค่าพื้นฐาน ⤵⤵ •$NC   ${BLUE}•${NC} Hysteria: $state_hysteria ${NC}"
+    echo -e "$BLUE•────────────────────────────────────────────────────────────────•$NC"
+
+    echo -e "$BLUE│$NC ${CYAN}[Obfs]${NC} ${ORANGE}•${NC} ${WHITE}$(cat /etc/volt/OBFS)${NC}"
+    echo -e "$BLUE│$NC ${CYAN}[รหัสผ่าน Auth]${NC} ${ORANGE}•${NC} ${WHITE}$(cat /etc/volt/PASSWORD)${NC}"
+    echo -e "$BLUE│$NC ${CYAN}[อนุญาต Insecure]${NC} ${ORANGE}•${NC} ${GREEN}[เปิด]${NC}"
+    echo -e "$BLUE└────────────────────────────────────────────────────────────────•$NC"
+
+    echo -e "$BLUE•────────────────────────────────────────────────────────────────┐$NC"
+
+    echo -e " ${BLUE}[01]${NC} ${ORANGE}•${NC} ${WHITE}สร้างรหัสผ่าน AUTH${NC}       $BLUE│$NC ${BLUE}[02]${NC} ${ORANGE}•${NC} ${WHITE}ดูรหัสผ่าน Auth${NC}"
+    echo -e " ${BLUE}[03]${NC} ${ORANGE}•${NC} ${WHITE}รีสตาร์ทบริการ Hysteria${NC} $BLUE│$NC ${BLUE}[04]${NC} ${ORANGE}•${NC} ${WHITE}ข้อมูลระบบ${NC}"
+
+    echo -e "$BLUE•────────────────────────────────────────────────────────────────┘${NC}"
+
+    echo -e "$BLUE┌─────────────────────────┐${NC}"
+    echo -e "$BLUE│$NC ${BLUE}[88]${NC} ${ORANGE}•${NC} ${WHITE}รีบูตเซิร์ฟเวอร์${NC}"
+    echo -e "$BLUE│$NC ${BLUE}[99]${NC} ${ORANGE}•${NC} ${WHITE}ถอนการติดตั้ง${NC}"
+    echo -e "$BLUE│$NC ${BLUE}[00]${NC} ${ORANGE}•${NC} ${RED}ออกจากโปรแกรม${NC}$NC"
+    echo -e "$BLUE└─────────────────────────┘${NC}"
+
+    echo ""
+    echo -ne " เลือกเมนู : "
+    read opt
+
+    case $opt in
+
+        01 | 1)
+            new_auth
+            ;;
+
+        02 | 2)
+            list_auth
+            ;;
+
+        03 | 3)
+            restart_services
+            ;;
+
+        04 | 4)
+            vps_info
+            ;;
+
+        88 | 8)
+            clear
+            reboot
+            ;;
+
+        99 | 9)
+            clear
+            hys_uninstaller
+            exit
+            ;;
+
+        00 | 0)
+            clear
+            exit
+            ;;
+
+        *)
+            clear
+            menu
+            ;;
+
+    esac
+}
+
+while [[ $? -eq 0 ]]; do
+    menu
+done
