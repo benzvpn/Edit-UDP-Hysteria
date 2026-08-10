@@ -23,13 +23,13 @@ script_header() {
     echo "  (_)   \ \`-' / | \`--. | |       "
     echo "         )---'  |( __.'\`-'       "
     echo "        (_)     (_)              "
-    echo "  FaceBook : Thongjuea Permsap //"
-    echo "  ..SSHX.. (c)2026 </> 2029 //"
+    echo "  Telegram: @voltsshx //"
+    echo "  ..SSHX.. (c)2021 </> 2024 //"
     echo ""
 
     echo -e "\e[1m\e[34m****************************************************"
     echo -e "  การติดตั้งและตั้งค่า \e[1;36mHysteria Protocol"
-    echo -e "              (เวอร์ชัน 2 5.1) - โดย: Thongjuea Permsap"
+    echo -e "              (เวอร์ชัน 1.3.5) - โดย: @voltsshx"
     echo -e "\e[1m\e[34m****************************************************\e[0m"
     echo ""
 }
@@ -44,8 +44,8 @@ update_packages() {
     echo "  (_)   \ \`-' / | \`--. | |       "
     echo "         )---'  |( __.'\`-'       "
     echo "        (_)     (_)              "
-    echo "  FaceBook : Thongjuea Permsap //"
-    echo "  ..SSHX.. (c)2026 </> 2029 //"
+    echo "  Telegram: @voltsshx //"
+    echo "  ..SSHX.. (c)2021 </> 2024 //"
     echo ""
 
     echo -e "\033[1;32m[\033[1;32mสำเร็จ ✅\033[1;32m] \033[1;37m ⇢  \033[1;33mกำลังเตรียมไฟล์ที่จำเป็น...\033[0m"
@@ -93,11 +93,13 @@ banner() {
     echo 'figlet -k Voltssh-X | lolcat' >>~/.bashrc
     echo 'figlet -k Hysteria | lolcat' >>~/.bashrc
 
-    echo 'echo -e "\t\e\033[94m⚙︎ Voltssh-X Hysteria โดย Thongjuea ⚙︎\033[0m"' >>~/.bashrc
-    echo 'echo -e "\t\e\033[94mTelegram: @benzvpn // \033[0m"' >>~/.bashrc
-    echo 'echo -e "\t\e\033[94m..SSHX.. (c)2026 </> 2029 // \033[0m"' >>~/.bashrc
+    echo 'echo -e "\t\e\033[94m⚙︎ Voltssh-X Hysteria โดย @voltsshx ⚙︎\033[0m"' >>~/.bashrc
+    echo 'echo -e "\t\e\033[94mTelegram: @voltsshx // \033[0m"' >>~/.bashrc
+    echo 'echo -e "\t\e\033[94m..SSHX.. (c)2021 </> 2024 // \033[0m"' >>~/.bashrc
     echo 'echo "" ' >>~/.bashrc
 
+    echo 'echo -e "\t\033[92mTelegram   : @voltsshx | LS Tunnels" ' >>~/.bashrc
+    echo 'echo -e "\t\e[1;33mPowered by : AIB Tech Pvt."' >>~/.bashrc
     echo 'echo ""' >>~/.bashrc
 
     echo 'DATE=$(date +"%d-%m-%y")' >>~/.bashrc
@@ -109,6 +111,8 @@ banner() {
     echo 'echo -e "\t\e[1;33mเวลาของเซิร์ฟเวอร์ : $TIME"' >>~/.bashrc
     echo 'echo "" ' >>~/.bashrc
 
+    echo 'echo -e "\t\e\033[94mอีเมลติดต่อ: iyke.earth@gmail.com \033[0m"' >>~/.bashrc
+    echo 'echo "" ' >>~/.bashrc
 
     echo 'echo -e "\t\e\033[92mคำสั่งเมนู: volt \033[0m"' >>~/.bashrc
     echo 'echo -e ""' >>~/.bashrc
@@ -158,6 +162,8 @@ verification() {
 
     echo -e " 〄 \033[1;37m ⌯  \033[1;33mคุณต้องมี Key ที่ซื้อมาเพื่อดำเนินการติดตั้ง\033[0m"
     echo -e " 〄 \033[1;37m ⌯  \033[1;33mหากยังไม่มี กรุณาติดต่อ [v3r!f.y.Key 𝕏]\033[0m"
+    echo -e " 〄 \033[1;37m ⌯ ⇢ \033[1;33mhttps://t.me/voltverifybot\033[0m"
+    echo -e " 〄 \033[1;37m ⌯  \033[1;33mสามารถติดต่อ @voltsshx ผ่าน Telegram ได้เช่นกัน\033[0m"
 
     echo ""
     echo "───────────────────────────────────────────────────────────────────────•"
@@ -254,16 +260,26 @@ verification() {
 
         mkdir -p /etc/volt
 
-        PROTOCOL="udp"
-        UDP_PORT=":36712"
-        UDP_PORT_HP="10000-65000"
-        HPStart="10000"
-        HPEnd="65000"
-        UDP_QUIC_WINDOW="196608"
-        remarks="VoltxHysteriaConfig"
-        sec="1"
+PROTOCOL="udp"
 
-        url=$(echo -e "hysteria://${DOMAIN}:${UDP_PORT}?mport=${HPStart}-${HPEnd}&protocol=${protocol}&auth=${PASSWORD}&obfsParam=${OBFS}&peer=${DOMAIN}&insecure=${sec}&upmbps=100&downmbps=100&alpn=#${remarks}" | sed 's/ /%20/g')
+# Hysteria Server listen port
+UDP_PORT="36712"
+
+# Port Hopping range
+UDP_PORT_HP="10000-65000"
+HPStart="10000"
+HPEnd="65000"
+
+# QUIC Receive Window
+UDP_QUIC_WINDOW="196608"
+
+# URI remark
+remarks="VoltxHysteriaConfig"
+
+# Self-signed certificate
+sec="1"
+
+        url="hysteria://${DOMAIN}:${UDP_PORT_HP}?protocol=${PROTOCOL}&auth=${PASSWORD}&obfsParam=${OBFS}&peer=${DOMAIN}&insecure=${sec}&upmbps=100&downmbps=100&alpn=h3#${remarks}"
 
         supportedApps="แอปที่รองรับ: AIO Tunnel, AIO Injector, Http Injector, NekoBox"
 
@@ -897,12 +913,36 @@ EOF
 
             rm -f "$_tmpfile"
         }
+get_latest_version() {
+    if [[ -n "$VERSION" ]]; then
+        echo "$VERSION"
+        return
+    fi
 
+    local _latest_version
+
+    _latest_version="$(
+        command curl -fsSL \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "$API_BASE_URL/releases/latest" |
+            grep -o '"tag_name":[[:space:]]*"[^"]*"' |
+            head -1 |
+            sed -E 's/.*"tag_name":[[:space:]]*"([^"]*)".*/\1/'
+    )"
+
+    if [[ -z "$_latest_version" ]]; then
+        error "ไม่สามารถตรวจสอบเวอร์ชัน Hysteria ล่าสุดจาก GitHub ได้"
+        exit 11
+    fi
+
+    echo "$_latest_version"
+}
         download_hysteria() {
             local _version="$1"
             local _destination="$2"
 
-            local _download_url="$REPO_URL/releases/download/v2.5.1/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
+            local _download_url="$REPO_URL/releases/download/$_version/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
 
             echo "กำลังดาวน์โหลด Hysteria: $_download_url ..."
 
@@ -919,19 +959,43 @@ EOF
         }
 
         perform_install_hysteria_binary() {
-            if [[ -n "$LOCAL_FILE" ]]; then
-                note "กำลังใช้ไฟล์ภายในเครื่อง: $LOCAL_FILE"
+    if [[ -n "$LOCAL_FILE" ]]; then
+        note "กำลังใช้ไฟล์ภายในเครื่อง: $LOCAL_FILE"
 
-                echo -ne "กำลังติดตั้งไฟล์ Hysteria ... "
+        echo -ne "กำลังติดตั้งไฟล์ Hysteria ... "
 
-                if install -Dm755 "$LOCAL_FILE" "$EXECUTABLE_INSTALL_PATH"; then
-                    echo "สำเร็จ"
-                else
-                    exit 2
-                fi
+        if install -Dm755 "$LOCAL_FILE" "$EXECUTABLE_INSTALL_PATH"; then
+            echo "สำเร็จ"
+        else
+            exit 2
+        fi
 
-                return
-            fi
+        return
+    fi
+
+    local _tmpfile
+    _tmpfile=$(mktemp)
+
+    VERSION="$(get_latest_version)"
+
+    echo "ตรวจพบ Hysteria เวอร์ชันล่าสุด: $VERSION"
+
+    if ! download_hysteria "$VERSION" "$_tmpfile"; then
+        rm -f "$_tmpfile"
+        exit 11
+    fi
+
+    echo -ne "กำลังติดตั้งไฟล์ Hysteria $VERSION ... "
+
+    if install -Dm755 "$_tmpfile" "$EXECUTABLE_INSTALL_PATH"; then
+        echo "สำเร็จ"
+    else
+        rm -f "$_tmpfile"
+        exit 13
+    fi
+
+    rm -f "$_tmpfile"
+}
 
             local _tmpfile=$(mktemp)
 
