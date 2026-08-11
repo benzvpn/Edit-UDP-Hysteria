@@ -34,7 +34,45 @@ install_dependencies() {
         fi
     fi
 }
+get_auth_password() {
+    local PASSWORD_FILE="/etc/volt/PASSWORD"
+    local CONFIG_FILE="/etc/hysteria/config.json"
+    local PASSWORD=""
 
+    # -----------------------------------------
+    # 1. อ่านจาก /etc/volt/PASSWORD
+    # -----------------------------------------
+    if [ -s "$PASSWORD_FILE" ]; then
+        cat "$PASSWORD_FILE"
+        return 0
+    fi
+
+    # -----------------------------------------
+    # 2. ถ้าไม่มี ให้ดึงจาก config.json
+    # -----------------------------------------
+    if [ -f "$CONFIG_FILE" ] && command_exists jq; then
+
+        PASSWORD=$(jq -r '.auth.config[0] // empty' \
+            "$CONFIG_FILE" 2>/dev/null)
+
+        if [ -n "$PASSWORD" ]; then
+
+            mkdir -p /etc/volt
+
+            printf '%s\n' "$PASSWORD" > "$PASSWORD_FILE"
+
+            chmod 600 "$PASSWORD_FILE"
+
+            echo "$PASSWORD"
+            return 0
+        fi
+    fi
+
+    # -----------------------------------------
+    # 3. ไม่พบ Auth
+    # -----------------------------------------
+    echo "ไม่พบรหัสผ่าน Auth"
+}
 reboot() {
     clear
     echo -e "${GREEN}ระบบจะรีบูตภายใน 3 วินาที...${NC}"
@@ -78,19 +116,53 @@ new_auth() {
     fi
 
     echo -e "${BLUE}┌──────────────────────────────────────────────────────•${NC}"
-    echo -e "${BLUE}• รายการ ⤵⤵ •${NC}  ${BLUE}•${NC} เพิ่มรหัสผ่านสำหรับ Auth ${NC}"
+    echo -e "${BLUE}• รายการ ⤵⤵ •${NC}  ${BLUE}•${NC} เพิ่มรหัสผ่านสำหรับ Auth"
     echo -e "${BLUE}•──────────────────────────────────────────────────────•${NC}"
     echo -e "${RED}หมายเหตุ: คุณสามารถเพิ่มรหัสผ่าน Auth ใหม่เพื่อใช้เป็นบัญชีได้${NC}"
     echo -e "${GREEN}    - สามารถเปลี่ยนรหัสผ่าน Auth ได้ที่ '/etc/hysteria/config.json'${NC}"
     echo -e "${ORANGE}    - OBFS เป็นค่าคงที่ สามารถเปลี่ยนได้ที่ '/etc/hysteria/config.json'${NC}"
     echo ""
-    echo ""
-    echo -e "${CYAN}OBFS : $(cat /etc/volt/OBFS) ${RESET}"
+
+    if [ -f "/etc/volt/OBFS" ]; then
+        echo -e "${CYAN}OBFS : $(cat /etc/volt/OBFS)${NC}"
+    else
+        echo -e "${CYAN}OBFS : ไม่พบข้อมูล${NC}"
+    fi
+
     echo ""
 
-    python3 /etc/volt/cfgupt.py
+    # สร้าง Auth ใหม่
+    if [ -f "/etc/volt/cfgupt.py" ]; then
+        python3 /etc/volt/cfgupt.py
+    else
+        echo -e "${RED}ไม่พบ /etc/volt/cfgupt.py${NC}"
+    fi
+
+    # -----------------------------------------
+    # Sync PASSWORD จาก Hysteria config
+    # -----------------------------------------
+    if [ -f "/etc/hysteria/config.json" ] && command_exists jq; then
+
+        PASSWORD=$(jq -r '.auth.config[0] // empty' \
+            /etc/hysteria/config.json 2>/dev/null)
+
+        if [ -n "$PASSWORD" ]; then
+            mkdir -p /etc/volt
+            printf '%s\n' "$PASSWORD" > /etc/volt/PASSWORD
+            chmod 600 /etc/volt/PASSWORD
+        fi
+    fi
+
+    # Restart Hysteria
     systemctl restart hysteria
 
+    if systemctl is-active --quiet hysteria; then
+        echo -e "${GREEN}Hysteria รีสตาร์ทสำเร็จ${NC}"
+    else
+        echo -e "${RED}ไม่สามารถรีสตาร์ท Hysteria ได้${NC}"
+    fi
+
+    echo ""
     read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
     menu
 }
@@ -306,7 +378,8 @@ menu() {
     echo -e "$BLUE•────────────────────────────────────────────────────────────────•$NC"
 
     echo -e "$BLUE│$NC ${CYAN}[Obfs]${NC} ${ORANGE}•${NC} ${WHITE}$(cat /etc/volt/OBFS)${NC}"
-    echo -e "$BLUE│$NC ${CYAN}[รหัสผ่าน Auth]${NC} ${ORANGE}•${NC} ${WHITE}$(cat /etc/volt/PASSWORD)${NC}"
+    AUTH_PASSWORD=$(get_auth_password)
+echo -e "$BLUE│$NC ${CYAN}[รหัสผ่าน Auth]${NC} ${ORANGE}•${NC} ${WHITE}${AUTH_PASSWORD}${NC}"
     echo -e "$BLUE│$NC ${CYAN}[อนุญาต Insecure]${NC} ${ORANGE}•${NC} ${GREEN}[เปิด]${NC}"
     echo -e "$BLUE└────────────────────────────────────────────────────────────────•$NC"
 
