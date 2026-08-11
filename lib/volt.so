@@ -35,43 +35,59 @@ install_dependencies() {
     fi
 }
 get_auth_password() {
-    local PASSWORD_FILE="/etc/volt/PASSWORD"
     local CONFIG_FILE="/etc/hysteria/config.json"
+    local PASSWORD_FILE="/etc/volt/PASSWORD"
     local PASSWORD=""
 
+    if [ ! -f "$CONFIG_FILE" ]; then
+        return 1
+    fi
+
+    if ! command_exists jq; then
+        return 1
+    fi
+
     # -----------------------------------------
-    # 1. อ่านจาก /etc/volt/PASSWORD
+    # Hysteria 2 userpass
     # -----------------------------------------
-    if [ -s "$PASSWORD_FILE" ]; then
-        cat "$PASSWORD_FILE"
+    PASSWORD=$(jq -r '
+        if .auth.type == "userpass"
+           and (.auth.userpass | type) == "object"
+        then
+            .auth.userpass
+            | to_entries
+            | .[0].value
+
+        elif .auth.type == "userpass"
+             and (.auth.userpass | type) == "array"
+        then
+            .auth.userpass[0]
+
+        elif .auth.type == "password"
+        then
+            .auth.password // empty
+
+        elif (.auth.config | type) == "array"
+        then
+            .auth.config[0]
+
+        else
+            empty
+        end
+    ' "$CONFIG_FILE" 2>/dev/null)
+
+    if [ -n "$PASSWORD" ] && [ "$PASSWORD" != "null" ]; then
+
+        mkdir -p /etc/volt
+
+        printf '%s\n' "$PASSWORD" > "$PASSWORD_FILE"
+        chmod 600 "$PASSWORD_FILE"
+
+        printf '%s' "$PASSWORD"
         return 0
     fi
 
-    # -----------------------------------------
-    # 2. ถ้าไม่มี ให้ดึงจาก config.json
-    # -----------------------------------------
-    if [ -f "$CONFIG_FILE" ] && command_exists jq; then
-
-        PASSWORD=$(jq -r '.auth.config[0] // empty' \
-            "$CONFIG_FILE" 2>/dev/null)
-
-        if [ -n "$PASSWORD" ]; then
-
-            mkdir -p /etc/volt
-
-            printf '%s\n' "$PASSWORD" > "$PASSWORD_FILE"
-
-            chmod 600 "$PASSWORD_FILE"
-
-            echo "$PASSWORD"
-            return 0
-        fi
-    fi
-
-    # -----------------------------------------
-    # 3. ไม่พบ Auth
-    # -----------------------------------------
-    echo "ไม่พบรหัสผ่าน Auth"
+    return 1
 }
 reboot() {
     clear
@@ -131,29 +147,50 @@ new_auth() {
 
     echo ""
 
-    # สร้าง Auth ใหม่
+    # =====================================================
+    # เปิด Hysteria 2 Password Manager
+    # =====================================================
     if [ -f "/etc/volt/cfgupt.py" ]; then
         python3 /etc/volt/cfgupt.py
     else
         echo -e "${RED}ไม่พบ /etc/volt/cfgupt.py${NC}"
     fi
 
-    # -----------------------------------------
-    # Sync PASSWORD จาก Hysteria config
-    # -----------------------------------------
+    # =====================================================
+    # Sync password หลังจากเพิ่ม/แก้ไข
+    # =====================================================
     if [ -f "/etc/hysteria/config.json" ] && command_exists jq; then
 
-        PASSWORD=$(jq -r '.auth.config[0] // empty' \
-            /etc/hysteria/config.json 2>/dev/null)
+        PASSWORD=$(jq -r '
+            if (.auth.userpass? | type) == "object" then
+                .auth.userpass
+                | to_entries
+                | .[0].value
 
-        if [ -n "$PASSWORD" ]; then
+            elif (.auth.userpass? | type) == "array" then
+                .auth.userpass[0]
+
+            elif (.auth.password? // null) != null then
+                .auth.password
+
+            elif (.auth.config? | type) == "array" then
+                .auth.config[0]
+
+            else
+                empty
+            end
+        ' /etc/hysteria/config.json 2>/dev/null)
+
+        if [ -n "$PASSWORD" ] && [ "$PASSWORD" != "null" ]; then
             mkdir -p /etc/volt
             printf '%s\n' "$PASSWORD" > /etc/volt/PASSWORD
             chmod 600 /etc/volt/PASSWORD
         fi
     fi
 
+    # =====================================================
     # Restart Hysteria
+    # =====================================================
     systemctl restart hysteria
 
     if systemctl is-active --quiet hysteria; then
@@ -170,42 +207,129 @@ new_auth() {
 list_auth() {
     clear
 
-    BLUE='\033[1;34m'
-    NC='\033[0m'
+    local BLUE='\033[1;34m'
+    local RED='\033[0;31m'
+    local GREEN='\033[0;32m'
+    local WHITE='\033[0;37m'
+    local NC='\033[0m'
 
-    json_file="/etc/hysteria/config.json"
+    local CONFIG_FILE="/etc/hysteria/config.json"
 
-    if ! command -v jq &>/dev/null; then
-        echo "ข้อผิดพลาด: ไม่พบ jq กรุณาติดตั้งด้วยตัวจัดการแพ็กเกจของระบบ"
-        exit 1
+    # -----------------------------------------
+    # ตรวจสอบ config
+    # -----------------------------------------
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}ไม่พบไฟล์ $CONFIG_FILE${NC}"
+        echo ""
+        read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
+        menu
+        return
     fi
 
-    passwords=$(jq -r '.auth.config[]' "$json_file")
+    # -----------------------------------------
+    # ตรวจสอบ jq
+    # -----------------------------------------
+    if ! command_exists jq; then
+        echo -e "${RED}ไม่พบ jq กรุณาติดตั้ง jq${NC}"
+        echo ""
+        read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
+        menu
+        return
+    fi
 
-    if [[ -n "$passwords" ]]; then
+    # -----------------------------------------
+    # ตรวจสอบ JSON
+    # -----------------------------------------
+    if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo -e "${RED}config.json ไม่ใช่ JSON ที่ถูกต้อง${NC}"
+        echo ""
+        read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
+        menu
+        return
+    fi
 
-        if command_exists figlet && command_exists lolcat; then
-            figlet -k Voltssh-X | lolcat
-            figlet -k Hysteria | lolcat
+    # -----------------------------------------
+    # Header
+    # -----------------------------------------
+    if command_exists figlet && command_exists lolcat; then
+        figlet -k Voltssh-X | lolcat
+        figlet -k Hysteria | lolcat
+    fi
+
+    echo -e "${BLUE}┌────────────────────────────────────────────────────────────────•${NC}"
+    echo -e "${BLUE}• รายการ ⤵⤵ •${NC}  ${BLUE}•${NC} รหัสผ่าน Auth"
+    echo -e "${BLUE}•────────────────────────────────────────────────────────────────•${NC}"
+
+    # -----------------------------------------
+    # อ่าน Auth จาก Hysteria 2
+    # -----------------------------------------
+    local AUTH_TYPE
+    AUTH_TYPE=$(jq -r '.auth.type // empty' "$CONFIG_FILE" 2>/dev/null)
+
+    # =========================================================
+    # Hysteria 2 : userpass
+    # =========================================================
+    if [ "$AUTH_TYPE" = "userpass" ]; then
+
+        local USERPASS_TYPE
+        USERPASS_TYPE=$(jq -r '.auth.userpass | type' "$CONFIG_FILE" 2>/dev/null)
+
+        if [ "$USERPASS_TYPE" = "object" ]; then
+
+            jq -r '
+                .auth.userpass
+                | to_entries[]
+                | "• \(.key) : \(.value)"
+            ' "$CONFIG_FILE" 2>/dev/null
+
+        elif [ "$USERPASS_TYPE" = "array" ]; then
+
+            jq -r '
+                .auth.userpass[]
+                | "• \(.)"
+            ' "$CONFIG_FILE" 2>/dev/null
+
         else
-            echo "กรุณาติดตั้ง 'figlet' และ 'lolcat' เพื่อการแสดงผลที่สวยงาม"
+            echo -e "${RED}• ไม่พบข้อมูล userpass${NC}"
         fi
 
-        echo -e "${BLUE}┌────────────────────────────────────────────────────────────────•${NC}"
-        echo -e "${BLUE}• รายการ ⤵⤵ •${NC}  ${BLUE}•${NC} รหัสผ่าน Auth ${NC}"
-        echo -e "${BLUE}•────────────────────────────────────────────────────────────────•${NC}"
+    # =========================================================
+    # Hysteria 2 : password
+    # =========================================================
+    elif [ "$AUTH_TYPE" = "password" ]; then
 
-        IFS=$'\n'
+        local PASSWORD
+        PASSWORD=$(jq -r '.auth.password // empty' "$CONFIG_FILE" 2>/dev/null)
 
-        for password in $passwords; do
-            echo -e "${BLUE}• ${password}"
-        done
+        if [ -n "$PASSWORD" ]; then
+            echo -e "${BLUE}• ${WHITE}${PASSWORD}${NC}"
+        else
+            echo -e "${RED}• ไม่พบรหัสผ่าน${NC}"
+        fi
 
-        echo -e "${BLUE}•────────────────────────────────────────────────────────────────•${NC}"
-
+    # =========================================================
+    # รองรับ config แบบเก่าที่ใช้ auth.config[]
+    # =========================================================
     else
-        echo "ไม่พบรหัสผ่านในระบบ"
+
+        local CONFIG_TYPE
+        CONFIG_TYPE=$(jq -r '.auth.config | type' "$CONFIG_FILE" 2>/dev/null)
+
+        if [ "$CONFIG_TYPE" = "array" ]; then
+
+            jq -r '
+                .auth.config[]
+                | "• \(.)"
+            ' "$CONFIG_FILE" 2>/dev/null
+
+        else
+            echo -e "${RED}• ไม่พบรหัสผ่าน Auth${NC}"
+            echo ""
+            echo -e "${ORANGE}Auth Type : ${AUTH_TYPE:-ไม่ระบุ}${NC}"
+        fi
     fi
+
+    echo -e "${BLUE}•────────────────────────────────────────────────────────────────•${NC}"
 
     echo ""
     read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
@@ -378,8 +502,13 @@ menu() {
     echo -e "$BLUE•────────────────────────────────────────────────────────────────•$NC"
 
     echo -e "$BLUE│$NC ${CYAN}[Obfs]${NC} ${ORANGE}•${NC} ${WHITE}$(cat /etc/volt/OBFS)${NC}"
-    AUTH_PASSWORD=$(get_auth_password)
-echo -e "$BLUE│$NC ${CYAN}[รหัสผ่าน Auth]${NC} ${ORANGE}•${NC} ${WHITE}${AUTH_PASSWORD}${NC}"
+    AUTH_PASSWORD=$(get_auth_password 2>/dev/null)
+if [ -n "$AUTH_PASSWORD" ]; then
+    AUTH_DISPLAY="$AUTH_PASSWORD"
+else
+    AUTH_DISPLAY="ไม่พบรหัสผ่าน Auth"
+fi
+echo -e "$BLUE│$NC ${CYAN}[รหัสผ่าน Auth]${NC} ${ORANGE}•${NC} ${WHITE}${AUTH_DISPLAY}${NC}"
     echo -e "$BLUE│$NC ${CYAN}[อนุญาต Insecure]${NC} ${ORANGE}•${NC} ${GREEN}[เปิด]${NC}"
     echo -e "$BLUE└────────────────────────────────────────────────────────────────•$NC"
 
