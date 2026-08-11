@@ -35,51 +35,58 @@ install_dependencies() {
     fi
 }
 get_auth_password() {
-    local CONFIG_FILE="/etc/hysteria/config.json"
     local PASSWORD_FILE="/etc/volt/PASSWORD"
+    local CONFIG_FILE="/etc/hysteria/config.json"
     local PASSWORD=""
 
+    # ==================================================
+    # 1. ถ้ามี /etc/volt/PASSWORD ให้ใช้ก่อน
+    # ==================================================
+    if [ -s "$PASSWORD_FILE" ]; then
+        PASSWORD=$(head -n 1 "$PASSWORD_FILE" | tr -d '\r')
+
+        if [ -n "$PASSWORD" ]; then
+            printf '%s' "$PASSWORD"
+            return 0
+        fi
+    fi
+
+    # ==================================================
+    # 2. ตรวจสอบ config.json
+    # ==================================================
     if [ ! -f "$CONFIG_FILE" ]; then
+        printf '%s' "ไม่พบ config.json"
         return 1
     fi
 
     if ! command_exists jq; then
+        printf '%s' "ไม่พบ jq"
         return 1
     fi
 
-    # -----------------------------------------
-    # Hysteria 2 userpass
-    # -----------------------------------------
+    # ==================================================
+    # 3. ตรวจสอบว่า JSON ถูกต้องหรือไม่
+    # ==================================================
+    if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        printf '%s' "config.json ไม่ถูกต้อง"
+        return 1
+    fi
+
+    # ==================================================
+    # 4. Hysteria 2
+    # auth:
+    #   type: password
+    #   password: xxxxx
+    # ==================================================
     PASSWORD=$(jq -r '
-        if .auth.type == "userpass"
-           and (.auth.userpass | type) == "object"
-        then
-            .auth.userpass
-            | to_entries
-            | .[0].value
-
-        elif .auth.type == "userpass"
-             and (.auth.userpass | type) == "array"
-        then
-            .auth.userpass[0]
-
-        elif .auth.type == "password"
-        then
-            .auth.password // empty
-
-        elif (.auth.config | type) == "array"
-        then
-            .auth.config[0]
-
-        else
-            empty
+        if (.auth.password? // "") != ""
+        then .auth.password
+        else ""
         end
     ' "$CONFIG_FILE" 2>/dev/null)
 
     if [ -n "$PASSWORD" ] && [ "$PASSWORD" != "null" ]; then
-
         mkdir -p /etc/volt
-
         printf '%s\n' "$PASSWORD" > "$PASSWORD_FILE"
         chmod 600 "$PASSWORD_FILE"
 
@@ -87,6 +94,31 @@ get_auth_password() {
         return 0
     fi
 
+    # ==================================================
+    # 5. Hysteria Legacy
+    # auth:
+    #   config:
+    #     - password
+    # ==================================================
+    PASSWORD=$(jq -r '
+        if (.auth.config? | type) == "array"
+        then
+            .auth.config[0] // ""
+        else
+            ""
+        end
+    ' "$CONFIG_FILE" 2>/dev/null)
+
+    if [ -n "$PASSWORD" ] && [ "$PASSWORD" != "null" ]; then
+        mkdir -p /etc/volt
+        printf '%s\n' "$PASSWORD" > "$PASSWORD_FILE"
+        chmod 600 "$PASSWORD_FILE"
+
+        printf '%s' "$PASSWORD"
+        return 0
+    fi
+
+    printf '%s' "ไม่พบรหัสผ่าน Auth"
     return 1
 }
 reboot() {
@@ -208,49 +240,45 @@ list_auth() {
     clear
 
     local BLUE='\033[1;34m'
-    local RED='\033[0;31m'
+    local CYAN='\033[0;36m'
     local GREEN='\033[0;32m'
+    local RED='\033[0;31m'
     local WHITE='\033[0;37m'
     local NC='\033[0m'
 
-    local CONFIG_FILE="/etc/hysteria/config.json"
+    local JSON_FILE="/etc/hysteria/config.json"
+    local PASSWORD_FILE="/etc/volt/PASSWORD"
 
-    # -----------------------------------------
-    # ตรวจสอบ config
-    # -----------------------------------------
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}ไม่พบไฟล์ $CONFIG_FILE${NC}"
-        echo ""
-        read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
-        menu
-        return
-    fi
-
-    # -----------------------------------------
-    # ตรวจสอบ jq
-    # -----------------------------------------
     if ! command_exists jq; then
-        echo -e "${RED}ไม่พบ jq กรุณาติดตั้ง jq${NC}"
+        echo -e "${RED}ไม่พบ jq${NC}"
         echo ""
-        read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
+        read -n 1 -s -r -p "กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
         menu
         return
     fi
 
-    # -----------------------------------------
+    if [ ! -f "$JSON_FILE" ]; then
+        echo -e "${RED}ไม่พบ $JSON_FILE${NC}"
+        echo ""
+        read -n 1 -s -r -p "กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
+        menu
+        return
+    fi
+
+    # ==================================================
     # ตรวจสอบ JSON
-    # -----------------------------------------
-    if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+    # ==================================================
+    if ! jq empty "$JSON_FILE" >/dev/null 2>&1; then
         echo -e "${RED}config.json ไม่ใช่ JSON ที่ถูกต้อง${NC}"
         echo ""
-        read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
+        echo -e "${ORANGE}กรุณาตรวจสอบไฟล์:${NC}"
+        echo -e "${WHITE}$JSON_FILE${NC}"
+        echo ""
+        read -n 1 -s -r -p "กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
         menu
         return
     fi
 
-    # -----------------------------------------
-    # Header
-    # -----------------------------------------
     if command_exists figlet && command_exists lolcat; then
         figlet -k Voltssh-X | lolcat
         figlet -k Hysteria | lolcat
@@ -260,76 +288,126 @@ list_auth() {
     echo -e "${BLUE}• รายการ ⤵⤵ •${NC}  ${BLUE}•${NC} รหัสผ่าน Auth"
     echo -e "${BLUE}•────────────────────────────────────────────────────────────────•${NC}"
 
-    # -----------------------------------------
-    # อ่าน Auth จาก Hysteria 2
-    # -----------------------------------------
-    local AUTH_TYPE
-    AUTH_TYPE=$(jq -r '.auth.type // empty' "$CONFIG_FILE" 2>/dev/null)
+    local FOUND=0
 
-    # =========================================================
-    # Hysteria 2 : userpass
-    # =========================================================
-    if [ "$AUTH_TYPE" = "userpass" ]; then
+    # ==================================================
+    # Hysteria 2 : auth.password
+    # ==================================================
+    local PASSWORD
 
-        local USERPASS_TYPE
-        USERPASS_TYPE=$(jq -r '.auth.userpass | type' "$CONFIG_FILE" 2>/dev/null)
+    PASSWORD=$(jq -r '
+        if (.auth.password? // "") != ""
+        then .auth.password
+        else ""
+        end
+    ' "$JSON_FILE" 2>/dev/null)
 
-        if [ "$USERPASS_TYPE" = "object" ]; then
+    if [ -n "$PASSWORD" ] && [ "$PASSWORD" != "null" ]; then
+        echo -e "${CYAN}• [01]${NC} ${WHITE}${PASSWORD}${NC}"
+        FOUND=1
 
-            jq -r '
-                .auth.userpass
-                | to_entries[]
-                | "• \(.key) : \(.value)"
-            ' "$CONFIG_FILE" 2>/dev/null
+        # Sync PASSWORD
+        mkdir -p /etc/volt
+        printf '%s\n' "$PASSWORD" > "$PASSWORD_FILE"
+        chmod 600 "$PASSWORD_FILE"
+    fi
 
-        elif [ "$USERPASS_TYPE" = "array" ]; then
+    # ==================================================
+    # Hysteria 2 : auth.userpass
+    #
+    # auth:
+    #   type: userpass
+    #   userpass:
+    #     user1: password1
+    #     user2: password2
+    # ==================================================
+    local USERPASS
 
-            jq -r '
-                .auth.userpass[]
-                | "• \(.)"
-            ' "$CONFIG_FILE" 2>/dev/null
-
+    USERPASS=$(jq -r '
+        if (.auth.userpass? | type) == "object"
+        then
+            .auth.userpass
+            | to_entries[]
+            | "\(.key):\(.value)"
         else
-            echo -e "${RED}• ไม่พบข้อมูล userpass${NC}"
-        fi
+            empty
+        end
+    ' "$JSON_FILE" 2>/dev/null)
 
-    # =========================================================
-    # Hysteria 2 : password
-    # =========================================================
-    elif [ "$AUTH_TYPE" = "password" ]; then
+    if [ -n "$USERPASS" ]; then
 
-        local PASSWORD
-        PASSWORD=$(jq -r '.auth.password // empty' "$CONFIG_FILE" 2>/dev/null)
+        local INDEX=1
+
+        while IFS= read -r LINE; do
+            [ -z "$LINE" ] && continue
+
+            echo -e "${CYAN}• [$(printf '%02d' "$INDEX")]${NC} ${WHITE}${LINE}${NC}"
+
+            INDEX=$((INDEX + 1))
+            FOUND=1
+        done <<< "$USERPASS"
+
+    fi
+
+    # ==================================================
+    # Legacy Hysteria : auth.config[]
+    # ==================================================
+    local LEGACY_PASSWORDS
+
+    LEGACY_PASSWORDS=$(jq -r '
+        if (.auth.config? | type) == "array"
+        then
+            .auth.config[]
+        else
+            empty
+        end
+    ' "$JSON_FILE" 2>/dev/null)
+
+    if [ -n "$LEGACY_PASSWORDS" ]; then
+
+        local INDEX=1
+
+        while IFS= read -r PASSWORD; do
+            [ -z "$PASSWORD" ] && continue
+
+            echo -e "${CYAN}• [$(printf '%02d' "$INDEX")]${NC} ${WHITE}${PASSWORD}${NC}"
+
+            # เก็บรหัสแรกไว้ใน PASSWORD
+            if [ ! -s "$PASSWORD_FILE" ]; then
+                mkdir -p /etc/volt
+                printf '%s\n' "$PASSWORD" > "$PASSWORD_FILE"
+                chmod 600 "$PASSWORD_FILE"
+            fi
+
+            INDEX=$((INDEX + 1))
+            FOUND=1
+
+        done <<< "$LEGACY_PASSWORDS"
+
+    fi
+
+    # ==================================================
+    # ถ้ายังไม่เจอ ลองอ่าน PASSWORD สำรอง
+    # ==================================================
+    if [ "$FOUND" -eq 0 ] && [ -s "$PASSWORD_FILE" ]; then
+
+        PASSWORD=$(head -n 1 "$PASSWORD_FILE" | tr -d '\r')
 
         if [ -n "$PASSWORD" ]; then
-            echo -e "${BLUE}• ${WHITE}${PASSWORD}${NC}"
-        else
-            echo -e "${RED}• ไม่พบรหัสผ่าน${NC}"
-        fi
-
-    # =========================================================
-    # รองรับ config แบบเก่าที่ใช้ auth.config[]
-    # =========================================================
-    else
-
-        local CONFIG_TYPE
-        CONFIG_TYPE=$(jq -r '.auth.config | type' "$CONFIG_FILE" 2>/dev/null)
-
-        if [ "$CONFIG_TYPE" = "array" ]; then
-
-            jq -r '
-                .auth.config[]
-                | "• \(.)"
-            ' "$CONFIG_FILE" 2>/dev/null
-
-        else
-            echo -e "${RED}• ไม่พบรหัสผ่าน Auth${NC}"
-            echo ""
-            echo -e "${ORANGE}Auth Type : ${AUTH_TYPE:-ไม่ระบุ}${NC}"
+            echo -e "${CYAN}• [01]${NC} ${WHITE}${PASSWORD}${NC}"
+            FOUND=1
         fi
     fi
 
     echo -e "${BLUE}•────────────────────────────────────────────────────────────────•${NC}"
+
+    if [ "$FOUND" -eq 0 ]; then
+        echo -e "${RED}ไม่พบรหัสผ่าน Auth${NC}"
+        echo ""
+        echo -e "${ORANGE}ตรวจสอบโครงสร้าง Auth ด้วยคำสั่ง:${NC}"
+        echo ""
+        echo -e "${WHITE}jq '.auth' /etc/hysteria/config.json${NC}"
+    fi
 
     echo ""
     read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
@@ -502,13 +580,13 @@ menu() {
     echo -e "$BLUE•────────────────────────────────────────────────────────────────•$NC"
 
     echo -e "$BLUE│$NC ${CYAN}[Obfs]${NC} ${ORANGE}•${NC} ${WHITE}$(cat /etc/volt/OBFS)${NC}"
-    AUTH_PASSWORD=$(get_auth_password 2>/dev/null)
-if [ -n "$AUTH_PASSWORD" ]; then
-    AUTH_DISPLAY="$AUTH_PASSWORD"
-else
-    AUTH_DISPLAY="ไม่พบรหัสผ่าน Auth"
+    AUTH_PASSWORD="$(get_auth_password 2>/dev/null)"
+
+if [ -z "$AUTH_PASSWORD" ]; then
+    AUTH_PASSWORD="ไม่พบรหัสผ่าน Auth"
 fi
-echo -e "$BLUE│$NC ${CYAN}[รหัสผ่าน Auth]${NC} ${ORANGE}•${NC} ${WHITE}${AUTH_DISPLAY}${NC}"
+
+echo -e "$BLUE│$NC ${CYAN}[รหัสผ่าน Auth]${NC} ${ORANGE}•${NC} ${WHITE}${AUTH_PASSWORD}${NC}"
     echo -e "$BLUE│$NC ${CYAN}[อนุญาต Insecure]${NC} ${ORANGE}•${NC} ${GREEN}[เปิด]${NC}"
     echo -e "$BLUE└────────────────────────────────────────────────────────────────•$NC"
 
