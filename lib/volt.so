@@ -1,654 +1,509 @@
-clear
+#!/usr/bin/env python3
 
-export GREEN='\e[32m'
-export RED='\033[0;31m'
-export BGBLUE='\e[1;44m'
-export ORANGE='\033[0;33m'
-export BLUE='\033[0;34m'
-export PURPLE='\033[0;35m'
-export CYAN='\033[0;36m'
-export BG='\E[44;1;39m'
-export NC='\033[0;37m'
-export WHITE='\033[0;37m'
-export TRY="[${RED} * ${NC}]"
+import json
+import os
+import sys
+import subprocess
+import shutil
+import tempfile
 
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
+CONFIG_FILE = "/etc/hysteria/config.json"
 
-install_dependencies() {
-    if ! command_exists figlet; then
-        echo "กำลังติดตั้ง figlet..."
-        sudo apt-get update
-        sudo apt-get install -y figlet
-    fi
 
-    if ! command_exists lolcat; then
-        echo "กำลังติดตั้ง lolcat..."
-        sudo apt-get update
-        sudo apt-get install -y lolcat
-        export PATH="/usr/games:$PATH"
+# ==============================
+# Colors
+# ==============================
 
-        if [ ! -e /usr/local/bin/lolcat ]; then
-            sudo ln -s /usr/games/lolcat /usr/local/bin/lolcat
-        fi
-    fi
-}
-get_auth_password() {
-    local PASSWORD_FILE="/etc/volt/PASSWORD"
-    local CONFIG_FILE="/etc/hysteria/config.json"
-    local PASSWORD=""
+RED = "\033[1;31m"
+GREEN = "\033[1;32m"
+YELLOW = "\033[1;33m"
+CYAN = "\033[1;36m"
+BLUE = "\033[1;34m"
+WHITE = "\033[1;37m"
+RESET = "\033[0m"
 
-    # ==================================================
-    # 1. ถ้ามี /etc/volt/PASSWORD ให้ใช้ก่อน
-    # ==================================================
-    if [ -s "$PASSWORD_FILE" ]; then
-        PASSWORD=$(head -n 1 "$PASSWORD_FILE" | tr -d '\r')
 
-        if [ -n "$PASSWORD" ]; then
-            printf '%s' "$PASSWORD"
-            return 0
-        fi
-    fi
+# ==============================
+# Header
+# ==============================
 
-    # ==================================================
-    # 2. ตรวจสอบ config.json
-    # ==================================================
-    if [ ! -f "$CONFIG_FILE" ]; then
-        printf '%s' "ไม่พบ config.json"
-        return 1
-    fi
+def header():
+    os.system("clear")
 
-    if ! command_exists jq; then
-        printf '%s' "ไม่พบ jq"
-        return 1
-    fi
+    print(f"{RED} Voltssh-X Hysteria by @Thongjuea{RESET}")
+    print(f"{YELLOW}  ⌯ Hysteria Auth Password Manager{RESET}")
+    print("    ------++------++------++------")
+    print()
 
-    # ==================================================
-    # 3. ตรวจสอบว่า JSON ถูกต้องหรือไม่
-    # ==================================================
-    if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
-        printf '%s' "config.json ไม่ถูกต้อง"
-        return 1
-    fi
 
-    # ==================================================
-    # 4. Hysteria 2
-    # auth:
-    #   type: password
-    #   password: xxxxx
-    # ==================================================
-    PASSWORD=$(jq -r '
-        if (.auth.password? // "") != ""
-        then .auth.password
-        else ""
-        end
-    ' "$CONFIG_FILE" 2>/dev/null)
+# ==============================
+# Root
+# ==============================
 
-    if [ -n "$PASSWORD" ] && [ "$PASSWORD" != "null" ]; then
-        mkdir -p /etc/volt
-        printf '%s\n' "$PASSWORD" > "$PASSWORD_FILE"
-        chmod 600 "$PASSWORD_FILE"
+def check_root():
+    if os.geteuid() != 0:
+        print(f"{RED}กรุณารันด้วย root{RESET}")
+        sys.exit(1)
 
-        printf '%s' "$PASSWORD"
-        return 0
-    fi
 
-    # ==================================================
-    # 5. Hysteria Legacy
-    # auth:
-    #   config:
-    #     - password
-    # ==================================================
-    PASSWORD=$(jq -r '
-        if (.auth.config? | type) == "array"
-        then
-            .auth.config[0] // ""
-        else
-            ""
-        end
-    ' "$CONFIG_FILE" 2>/dev/null)
+# ==============================
+# Config
+# ==============================
 
-    if [ -n "$PASSWORD" ] && [ "$PASSWORD" != "null" ]; then
-        mkdir -p /etc/volt
-        printf '%s\n' "$PASSWORD" > "$PASSWORD_FILE"
-        chmod 600 "$PASSWORD_FILE"
+def check_config():
+    if not os.path.isfile(CONFIG_FILE):
+        print(f"{RED}ไม่พบไฟล์ config:{RESET}")
+        print(CONFIG_FILE)
+        sys.exit(1)
 
-        printf '%s' "$PASSWORD"
-        return 0
-    fi
 
-    printf '%s' "ไม่พบรหัสผ่าน Auth"
-    return 1
-}
-reboot() {
-    clear
-    echo -e "${GREEN}ระบบจะรีบูตภายใน 3 วินาที...${NC}"
-    sleep 3
-    echo ""
-    echo -e "${RED}กำลังรีบูต...${NC}"
-    sudo reboot
-}
+def load_config():
+    check_config()
 
-restart_services() {
-    GREEN="\033[0;32m"
-    RED="\033[0;31m"
-    RESET="\033[0m"
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            config = json.load(f)
 
-    sudo systemctl restart hysteria
+        if not isinstance(config, dict):
+            raise ValueError("config ต้องเป็น JSON object")
 
-    if systemctl is-active hysteria >/dev/null; then
-        echo -e "บริการ Hysteria ${GREEN}ทำงานอยู่${RESET}"
-    else
-        echo -e "บริการ Hysteria ${RED}ไม่ได้ทำงาน${RESET}"
-    fi
+        return config
 
-    if systemctl is-enabled hysteria >/dev/null; then
-        echo -e "บริการ Hysteria ${GREEN}เปิดใช้งานอัตโนมัติแล้ว${RESET}"
-    else
-        echo -e "บริการ Hysteria ${RED}ยังไม่ได้เปิดใช้งานอัตโนมัติ${RESET}"
-    fi
+    except json.JSONDecodeError as e:
+        print(f"{RED}config.json ไม่ถูกต้อง{RESET}")
+        print()
+        print(f"บรรทัด : {e.lineno}")
+        print(f"คอลัมน์: {e.colno}")
+        print(f"ตำแหน่ง: {e.pos}")
+        print(f"ข้อความ: {e.msg}")
+        sys.exit(1)
 
-    read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
-    menu
-}
+    except Exception as e:
+        print(f"{RED}ไม่สามารถอ่าน config ได้{RESET}")
+        print(e)
+        sys.exit(1)
 
-new_auth() {
-    clear
 
-    if command_exists figlet && command_exists lolcat; then
-        figlet -k Voltssh-X | lolcat
-        figlet -k Hysteria | lolcat
-    else
-        echo "กรุณาติดตั้ง 'figlet' และ 'lolcat' เพื่อการแสดงผลที่สวยงาม"
-    fi
+# ==============================
+# Backup
+# ==============================
 
-    echo -e "${BLUE}┌──────────────────────────────────────────────────────•${NC}"
-    echo -e "${BLUE}• รายการ ⤵⤵ •${NC}  ${BLUE}•${NC} เพิ่มรหัสผ่านสำหรับ Auth"
-    echo -e "${BLUE}•──────────────────────────────────────────────────────•${NC}"
-    echo -e "${RED}หมายเหตุ: คุณสามารถเพิ่มรหัสผ่าน Auth ใหม่เพื่อใช้เป็นบัญชีได้${NC}"
-    echo -e "${GREEN}    - สามารถเปลี่ยนรหัสผ่าน Auth ได้ที่ '/etc/hysteria/config.json'${NC}"
-    echo -e "${ORANGE}    - OBFS เป็นค่าคงที่ สามารถเปลี่ยนได้ที่ '/etc/hysteria/config.json'${NC}"
-    echo ""
+def backup_config():
+    backup = CONFIG_FILE + ".bak"
 
-    if [ -f "/etc/volt/OBFS" ]; then
-        echo -e "${CYAN}OBFS : $(cat /etc/volt/OBFS)${NC}"
-    else
-        echo -e "${CYAN}OBFS : ไม่พบข้อมูล${NC}"
-    fi
+    try:
+        shutil.copy2(CONFIG_FILE, backup)
+        print(f"{GREEN}สร้าง backup แล้ว:{RESET} {backup}")
+        return True
 
-    echo ""
+    except Exception as e:
+        print(f"{RED}สร้าง backup ไม่สำเร็จ: {e}{RESET}")
+        return False
 
-    # =====================================================
-    # เปิด Hysteria 2 Password Manager
-    # =====================================================
-    if [ -f "/etc/volt/cfgupt.py" ]; then
-        python3 /etc/volt/cfgupt.py
-    else
-        echo -e "${RED}ไม่พบ /etc/volt/cfgupt.py${NC}"
-    fi
 
-    # =====================================================
-    # Sync password หลังจากเพิ่ม/แก้ไข
-    # =====================================================
-    if [ -f "/etc/hysteria/config.json" ] && command_exists jq; then
+# ==============================
+# Save config
+# ==============================
 
-        PASSWORD=$(jq -r '
-            if (.auth.userpass? | type) == "object" then
-                .auth.userpass
-                | to_entries
-                | .[0].value
+def save_config(config):
+    try:
+        # ตรวจสอบ JSON ก่อน
+        json.dumps(config, ensure_ascii=False)
 
-            elif (.auth.userpass? | type) == "array" then
-                .auth.userpass[0]
+        directory = os.path.dirname(CONFIG_FILE)
 
-            elif (.auth.password? // null) != null then
-                .auth.password
+        fd, temp_file = tempfile.mkstemp(
+            prefix=".config.",
+            suffix=".json",
+            dir=directory
+        )
 
-            elif (.auth.config? | type) == "array" then
-                .auth.config[0]
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(
+                config,
+                f,
+                indent=2,
+                ensure_ascii=False
+            )
+            f.write("\n")
 
-            else
-                empty
-            end
-        ' /etc/hysteria/config.json 2>/dev/null)
+        os.chmod(temp_file, 0o600)
+        os.replace(temp_file, CONFIG_FILE)
 
-        if [ -n "$PASSWORD" ] && [ "$PASSWORD" != "null" ]; then
-            mkdir -p /etc/volt
-            printf '%s\n' "$PASSWORD" > /etc/volt/PASSWORD
-            chmod 600 /etc/volt/PASSWORD
-        fi
-    fi
+        return True
 
-    # =====================================================
-    # Restart Hysteria
-    # =====================================================
-    systemctl restart hysteria
+    except Exception as e:
+        print(f"{RED}บันทึก config ไม่สำเร็จ: {e}{RESET}")
 
-    if systemctl is-active --quiet hysteria; then
-        echo -e "${GREEN}Hysteria รีสตาร์ทสำเร็จ${NC}"
-    else
-        echo -e "${RED}ไม่สามารถรีสตาร์ท Hysteria ได้${NC}"
-    fi
+        try:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        except Exception:
+            pass
 
-    echo ""
-    read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
-    menu
-}
+        return False
 
-list_auth() {
-    clear
 
-    local BLUE='\033[1;34m'
-    local CYAN='\033[0;36m'
-    local GREEN='\033[0;32m'
-    local RED='\033[0;31m'
-    local WHITE='\033[0;37m'
-    local NC='\033[0m'
+# ==============================
+# Get userpass
+# ==============================
 
-    local JSON_FILE="/etc/hysteria/config.json"
-    local PASSWORD_FILE="/etc/volt/PASSWORD"
+def get_userpass(config):
+    auth = config.get("auth")
 
-    if ! command_exists jq; then
-        echo -e "${RED}ไม่พบ jq${NC}"
-        echo ""
-        read -n 1 -s -r -p "กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
-        menu
+    if not isinstance(auth, dict):
+        return {}
+
+    userpass = auth.get("userpass")
+
+    if not isinstance(userpass, dict):
+        return {}
+
+    return userpass
+
+
+# ==============================
+# Ensure auth structure
+# ==============================
+
+def ensure_auth(config):
+    if not isinstance(config.get("auth"), dict):
+        config["auth"] = {}
+
+    config["auth"]["type"] = "userpass"
+
+    if not isinstance(config["auth"].get("userpass"), dict):
+        config["auth"]["userpass"] = {}
+
+    return config["auth"]["userpass"]
+
+
+# ==============================
+# Add password
+# ==============================
+
+def add_password():
+
+    config = load_config()
+
+    userpass = ensure_auth(config)
+
+    print()
+    print(f"{CYAN}========== เพิ่มรหัสผ่าน AUTH =========={RESET}")
+    print()
+
+    username = input("  * Username: ").strip()
+
+    if not username:
+        print(f"{RED}Username ห้ามว่าง{RESET}")
         return
-    fi
 
-    if [ ! -f "$JSON_FILE" ]; then
-        echo -e "${RED}ไม่พบ $JSON_FILE${NC}"
-        echo ""
-        read -n 1 -s -r -p "กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
-        menu
+    if username in userpass:
+        print(f"{YELLOW}Username นี้มีอยู่แล้ว{RESET}")
         return
-    fi
 
-    # ==================================================
-    # ตรวจสอบ JSON
-    # ==================================================
-    if ! jq empty "$JSON_FILE" >/dev/null 2>&1; then
-        echo -e "${RED}config.json ไม่ใช่ JSON ที่ถูกต้อง${NC}"
-        echo ""
-        echo -e "${ORANGE}กรุณาตรวจสอบไฟล์:${NC}"
-        echo -e "${WHITE}$JSON_FILE${NC}"
-        echo ""
-        read -n 1 -s -r -p "กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
-        menu
+    password = input("  * Password: ").strip()
+
+    if not password:
+        print(f"{RED}Password ห้ามว่าง{RESET}")
         return
-    fi
-
-    if command_exists figlet && command_exists lolcat; then
-        figlet -k Voltssh-X | lolcat
-        figlet -k Hysteria | lolcat
-    fi
-
-    echo -e "${BLUE}┌────────────────────────────────────────────────────────────────•${NC}"
-    echo -e "${BLUE}• รายการ ⤵⤵ •${NC}  ${BLUE}•${NC} รหัสผ่าน Auth"
-    echo -e "${BLUE}•────────────────────────────────────────────────────────────────•${NC}"
-
-    local FOUND=0
-
-    # ==================================================
-    # Hysteria 2 : auth.password
-    # ==================================================
-    local PASSWORD
-
-    PASSWORD=$(jq -r '
-        if (.auth.password? // "") != ""
-        then .auth.password
-        else ""
-        end
-    ' "$JSON_FILE" 2>/dev/null)
-
-    if [ -n "$PASSWORD" ] && [ "$PASSWORD" != "null" ]; then
-        echo -e "${CYAN}• [01]${NC} ${WHITE}${PASSWORD}${NC}"
-        FOUND=1
-
-        # Sync PASSWORD
-        mkdir -p /etc/volt
-        printf '%s\n' "$PASSWORD" > "$PASSWORD_FILE"
-        chmod 600 "$PASSWORD_FILE"
-    fi
-
-    # ==================================================
-    # Hysteria 2 : auth.userpass
-    #
-    # auth:
-    #   type: userpass
-    #   userpass:
-    #     user1: password1
-    #     user2: password2
-    # ==================================================
-    local USERPASS
-
-    USERPASS=$(jq -r '
-        if (.auth.userpass? | type) == "object"
-        then
-            .auth.userpass
-            | to_entries[]
-            | "\(.key):\(.value)"
-        else
-            empty
-        end
-    ' "$JSON_FILE" 2>/dev/null)
-
-    if [ -n "$USERPASS" ]; then
-
-        local INDEX=1
-
-        while IFS= read -r LINE; do
-            [ -z "$LINE" ] && continue
-
-            echo -e "${CYAN}• [$(printf '%02d' "$INDEX")]${NC} ${WHITE}${LINE}${NC}"
-
-            INDEX=$((INDEX + 1))
-            FOUND=1
-        done <<< "$USERPASS"
-
-    fi
-
-    # ==================================================
-    # Legacy Hysteria : auth.config[]
-    # ==================================================
-    local LEGACY_PASSWORDS
-
-    LEGACY_PASSWORDS=$(jq -r '
-        if (.auth.config? | type) == "array"
-        then
-            .auth.config[]
-        else
-            empty
-        end
-    ' "$JSON_FILE" 2>/dev/null)
-
-    if [ -n "$LEGACY_PASSWORDS" ]; then
-
-        local INDEX=1
-
-        while IFS= read -r PASSWORD; do
-            [ -z "$PASSWORD" ] && continue
-
-            echo -e "${CYAN}• [$(printf '%02d' "$INDEX")]${NC} ${WHITE}${PASSWORD}${NC}"
-
-            # เก็บรหัสแรกไว้ใน PASSWORD
-            if [ ! -s "$PASSWORD_FILE" ]; then
-                mkdir -p /etc/volt
-                printf '%s\n' "$PASSWORD" > "$PASSWORD_FILE"
-                chmod 600 "$PASSWORD_FILE"
-            fi
-
-            INDEX=$((INDEX + 1))
-            FOUND=1
-
-        done <<< "$LEGACY_PASSWORDS"
-
-    fi
-
-    # ==================================================
-    # ถ้ายังไม่เจอ ลองอ่าน PASSWORD สำรอง
-    # ==================================================
-    if [ "$FOUND" -eq 0 ] && [ -s "$PASSWORD_FILE" ]; then
-
-        PASSWORD=$(head -n 1 "$PASSWORD_FILE" | tr -d '\r')
-
-        if [ -n "$PASSWORD" ]; then
-            echo -e "${CYAN}• [01]${NC} ${WHITE}${PASSWORD}${NC}"
-            FOUND=1
-        fi
-    fi
-
-    echo -e "${BLUE}•────────────────────────────────────────────────────────────────•${NC}"
 
-    if [ "$FOUND" -eq 0 ]; then
-        echo -e "${RED}ไม่พบรหัสผ่าน Auth${NC}"
-        echo ""
-        echo -e "${ORANGE}ตรวจสอบโครงสร้าง Auth ด้วยคำสั่ง:${NC}"
-        echo ""
-        echo -e "${WHITE}jq '.auth' /etc/hysteria/config.json${NC}"
-    fi
+    if len(password) < 10:
+        print(f"{RED}Password ต้องมีอย่างน้อย 10 ตัวอักษร{RESET}")
+        return
 
-    echo ""
-    read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
-    menu
-}
-
-vps_info() {
-    clear
-
-    install_dependencies
-
-    DESCRIPTION=$(lsb_release -sd)
-    CODENAME=$(lsb_release -sc)
-    KERNEL=$(uname -r)
-    COUNTRY=$(curl -s "https://ipinfo.io/city")
-    PUBLIC_IP=$(curl -s https://api.ipify.org)
-    ORG=$(curl -s "https://ipinfo.io/org")
-
-    if command_exists figlet && command_exists lolcat; then
-        figlet -k Voltssh-X | lolcat
-        figlet -k Hysteria | lolcat
-    else
-        echo "กรุณาติดตั้ง 'figlet' และ 'lolcat' เพื่อการแสดงผลที่สวยงาม"
-    fi
-
-    echo -e "$BLUE•──────────────────────────────────────────────•$NC"
-    echo -e "$BLUE│$NC       •• ข้อมูล VPS ••  $NC"
-    echo -e "$BLUE└──────────────────────────────────────────────┘$NC"
-
-    echo -e "$BLUE┌──────────────────────────────────────────────┐$NC"
-    echo -e "$BLUE│$NC IP : $PUBLIC_IP"
-    echo -e "$BLUE│$NC ประเทศ : $COUNTRY"
-    echo -e "$BLUE│$NC ผู้ให้บริการ : $ORG"
-    echo -e "$BLUE│$NC ระบบปฏิบัติการ : $DESCRIPTION"
-    echo -e "$BLUE│$NC Codename : $CODENAME"
-    echo -e "$BLUE│$NC Kernel : $KERNEL"
-    echo -e "$BLUE└──────────────────────────────────────────────┘$NC"
+    if password in userpass.values():
+        print(f"{YELLOW}Password นี้มีอยู่แล้ว{RESET}")
+        return
 
-    echo -e "$BLUE•──────────────────────────────────────────────•$NC"
-    echo ""
+    print()
+    print(f"{YELLOW}กำลังบันทึก...{RESET}")
 
-    read -n 1 -s -r -p "  กดปุ่มใดก็ได้เพื่อกลับ ↩︎"
-    menu
-}
+    if not backup_config():
+        return
 
-hys_uninstaller() {
-    clear
+    userpass[username] = password
 
-    figlet -k Voltssh-X | lolcat
-    figlet -k Hysteria | lolcat
+    if save_config(config):
 
-    echo ""
-    echo -e "\033[1;32m     โปรแกรมถอนการติดตั้ง!\033[1;33m"
-    echo -e "$BLUE•──────────────────────────────────────────•$NC"
-
-    read -p "ต้องการดำเนินการถอนการติดตั้งหรือไม่? [Y/n] " resp
+        print()
+        print(f"{GREEN}================================{RESET}")
+        print(f"{GREEN}เพิ่ม AUTH สำเร็จ ✓{RESET}")
+        print(f"{WHITE}Username: {username}{RESET}")
+        print(f"{WHITE}Password: {password}{RESET}")
+        print(f"{GREEN}================================{RESET}")
 
-    if [[ "$resp" = y || "$resp" = Y ]]; then
+        restart_service()
 
-        echo ""
-        echo -e " \e[1;33mขอให้คุณโชคดีต่อไป! 💙\033[0m"
-        echo ""
-        echo -e " \e[1;33mสามารถส่งความคิดเห็นของคุณได้ที่:\033[0m"
-        echo -e " \e[1;33m[ 👨🏽‍💻 ผู้จัดทำ: Thongjuea ]\033[0m"
-        echo -e " \033[92m⇢ facebook : Thongjuea Permsap\033[0m"
-        echo ""
-        echo -e " \033[92m⇢ แจ้งเตือน: เซิร์ฟเวอร์อาจถูกตัดการเชื่อมต่อ!\033[0m"
 
-        sleep 5
+# ==============================
+# List passwords
+# ==============================
 
-        apt-get purge screen -y >/dev/null 2>&1
-        apt-get purge nmap -y >/dev/null 2>&1
-        apt-get purge dropbear -y >/dev/null 2>&1
-        apt-get purge apache2 -y >/dev/null 2>&1
+def list_passwords():
 
-        systemctl stop hysteria &>/dev/null
-        systemctl disable hysteria &>/dev/null
+    config = load_config()
 
-        rm -f /etc/systemd/system/hysteria.service &>/dev/null
-        rm -rf /etc/volt/hy1 &>/dev/null
-        rm -rf /etc/hysteria &>/dev/null
+    userpass = get_userpass(config)
 
-        sudo systemctl stop hysteria-server &>/dev/null
-        systemctl disable hysteria-server &>/dev/null
+    print()
+    print(f"{CYAN}========== รายการ AUTH =========={RESET}")
+    print()
 
-        rm -f /etc/systemd/system/hysteria-server.service &>/dev/null
-        rm -f /etc/systemd/system/multi-user.target.wants/hysteria-server.service &>/dev/null
-        rm -f /etc/systemd/system/multi-user.target.wants/hysteria-server@*.service &>/dev/null
+    if not userpass:
+        print(f"{YELLOW}ยังไม่มี Username / Password{RESET}")
+        return
 
-        systemctl daemon-reload &>/dev/null
+    for idx, (username, password) in enumerate(userpass.items(), 1):
 
-        sudo rm -rf /etc/hysteria &>/dev/null
-        sudo rm -rf /etc/volt &>/dev/null
+        print(
+            f"{WHITE}{idx}. "
+            f"Username: {username} "
+            f"| Password: {password}{RESET}"
+        )
 
-        rm -f /etc/systemd/system/hysteria-server.service &>/dev/null
-        rm -rf /etc/volt/hy2 &>/dev/null
-        rm -rf /etc/hysteria &>/dev/null
-        rm -rf /root/hy &>/dev/null
+    print()
+    print(f"{GREEN}รวมทั้งหมด: {len(userpass)} รายการ{RESET}")
 
-        remove_n_purge() {
-            sudo apt-get remove --purge -y \
-                apache2 \
-                dropbear \
-                dos2unix \
-                nload \
-                jq \
-                lolcat \
-                figlet \
-                screen \
-                nodejs \
-                npm \
-                iptables > /dev/null 2>&1
-        }
 
-        remove_n_purge
+# ==============================
+# Delete password
+# ==============================
 
-        rm -rf /etc/volt >/dev/null 2>&1
+def delete_password():
 
-        sed -i '/figlet -k Voltssh-X | lolcat/,/echo -e ""/d' ~/.bashrc
-        sed -i '/figlet -k Hsyteria | lolcat/,/echo -e ""/d' ~/.bashrc
+    config = load_config()
 
-        pkill -9 screen >/dev/null 2>&1
+    userpass = get_userpass(config)
 
-        echo -e "\033[1;36mถอนการติดตั้งสำเร็จ!\033[1;33m"
-        echo ""
+    if not userpass:
+        print(f"{YELLOW}ไม่มี AUTH ให้ลบ{RESET}")
+        return
 
-        echo -e "อ่านข้อมูลนี้! (5 วินาที)"
-        echo -e "\033[1;36mหากเมนูยังคงแสดงอยู่ ให้กด Ctrl+C เพื่อบังคับออก\033[1;33m"
-        echo -e "\033[1;36mไม่ใช่ข้อผิดพลาดแต่อย่างใด!\033[1;33m"
+    print()
+    print(f"{CYAN}========== ลบ AUTH =========={RESET}")
+    print()
 
-        sleep 5
-        exit
+    items = list(userpass.items())
 
-    else
+    for idx, (username, password) in enumerate(items, 1):
 
-        echo -e "\033[1;32mคุณไม่ได้ถอนการติดตั้ง\033[1;33m"
-        echo -e "\033[1;32mกำลังกลับไปยังเมนู...\033[0;37m"
+        print(
+            f"{idx}. "
+            f"Username: {username} "
+            f"| Password: {password}"
+        )
 
-        sleep 2
-        menu
-    fi
-}
+    print()
 
-menu() {
-    clear
+    choice = input("เลือกหมายเลขที่ต้องการลบ: ").strip()
 
-    UDP_PORT_HP=$(cat /etc/volt/UDP_PORT_HP)
-    RmtPORT=36712
+    try:
+        idx = int(choice)
 
-    if [[ $(systemctl is-active hysteria) == 'active' ]]; then
-        state_hysteria="\e[1m\e[32m[เปิดใช้งาน]"
-    else
-        state_hysteria="\e[1m\e[31m[ปิดใช้งาน]"
-    fi
+    except ValueError:
+        print(f"{RED}กรุณาใส่หมายเลข{RESET}")
+        return
 
-    figlet -k Voltssh-X Hysteria | lolcat
+    if idx < 1 or idx > len(items):
+        print(f"{RED}หมายเลขไม่ถูกต้อง{RESET}")
+        return
 
-    echo -e "$BLUE┌────────────────────────────────────────────────────────────────•${NC}"
-    echo -e "$BLUE│$NC ${ORANGE}•${NC} เวอร์ชัน: ${BLUE}voltx 1.3.5${NC}      ${BLUE}•${NC} IP: $(curl -sS ipv4.icanhazip.com)"
-    echo -e "$BLUE│$NC ${ORANGE}•${NC} ช่อง TG: ${BLUE}@lstunnels${NC}    ${BLUE}•${NC} โดเมน: $(cat /etc/volt/DOMAIN)"
-    echo -e "$BLUE│$NC ${ORANGE}•${NC} DevChat: ${BLUE}@voltsshx${NC}        ${BLUE}•${NC} Uptime: $(uptime -p | sed 's/up //')"
-    echo -e "$BLUE└────────────────────────────────────────────────────────────────•${NC}"
+    username, password = items[idx - 1]
 
-    echo -e "$BLUE┌────────────────────────────────────────────────────────────────•$NC"
-    echo -e "$BLUE│$NC  โปรโตคอล : [$(cat /etc/volt/PROTOCOL)]    ${BLUE}•${NC} พอร์ต UDP : ${RmtPORT}, ${UDP_PORT_HP} $NC"
-    echo -e "$BLUE└────────────────────────────────────────────────────────────────•$NC"
+    print()
+    print(f"{YELLOW}Username: {username}{RESET}")
 
-    echo -e "$BLUE┌────────────────────────────────────────────────────────────────•$NC"
-    echo -e "$BLUE• ค่าพื้นฐาน ⤵⤵ •$NC   ${BLUE}•${NC} Hysteria: $state_hysteria ${NC}"
-    echo -e "$BLUE•────────────────────────────────────────────────────────────────•$NC"
+    confirm = input("ยืนยันการลบ? [y/N]: ").strip().lower()
 
-    echo -e "$BLUE│$NC ${CYAN}[Obfs]${NC} ${ORANGE}•${NC} ${WHITE}$(cat /etc/volt/OBFS)${NC}"
-    AUTH_PASSWORD="$(get_auth_password 2>/dev/null)"
+    if confirm != "y":
+        print(f"{YELLOW}ยกเลิก{RESET}")
+        return
 
-if [ -z "$AUTH_PASSWORD" ]; then
-    AUTH_PASSWORD="ไม่พบรหัสผ่าน Auth"
-fi
+    if not backup_config():
+        return
 
-echo -e "$BLUE│$NC ${CYAN}[รหัสผ่าน Auth]${NC} ${ORANGE}•${NC} ${WHITE}${AUTH_PASSWORD}${NC}"
-    echo -e "$BLUE│$NC ${CYAN}[อนุญาต Insecure]${NC} ${ORANGE}•${NC} ${GREEN}[เปิด]${NC}"
-    echo -e "$BLUE└────────────────────────────────────────────────────────────────•$NC"
+    del userpass[username]
 
-    echo -e "$BLUE•────────────────────────────────────────────────────────────────┐$NC"
+    if save_config(config):
 
-    echo -e " ${BLUE}[01]${NC} ${ORANGE}•${NC} ${WHITE}สร้างรหัสผ่าน AUTH${NC}       $BLUE│$NC ${BLUE}[02]${NC} ${ORANGE}•${NC} ${WHITE}ดูรหัสผ่าน Auth${NC}"
-    echo -e " ${BLUE}[03]${NC} ${ORANGE}•${NC} ${WHITE}รีสตาร์ทบริการ Hysteria${NC} $BLUE│$NC ${BLUE}[04]${NC} ${ORANGE}•${NC} ${WHITE}ข้อมูลระบบ${NC}"
+        print()
+        print(f"{GREEN}ลบ AUTH สำเร็จ ✓{RESET}")
 
-    echo -e "$BLUE•────────────────────────────────────────────────────────────────┘${NC}"
+        restart_service()
 
-    echo -e "$BLUE┌─────────────────────────┐${NC}"
-    echo -e "$BLUE│$NC ${BLUE}[88]${NC} ${ORANGE}•${NC} ${WHITE}รีบูตเซิร์ฟเวอร์${NC}"
-    echo -e "$BLUE│$NC ${BLUE}[99]${NC} ${ORANGE}•${NC} ${WHITE}ถอนการติดตั้ง${NC}"
-    echo -e "$BLUE│$NC ${BLUE}[00]${NC} ${ORANGE}•${NC} ${RED}ออกจากโปรแกรม${NC}$NC"
-    echo -e "$BLUE└─────────────────────────┘${NC}"
 
-    echo ""
-    echo -ne " เลือกเมนู : "
-    read opt
+# ==============================
+# Delete all
+# ==============================
 
-    case $opt in
+def delete_all():
 
-        01 | 1)
-            new_auth
-            ;;
+    config = load_config()
 
-        02 | 2)
-            list_auth
-            ;;
+    userpass = get_userpass(config)
 
-        03 | 3)
-            restart_services
-            ;;
+    if not userpass:
+        print(f"{YELLOW}ไม่มี AUTH ให้ลบ{RESET}")
+        return
 
-        04 | 4)
-            vps_info
-            ;;
+    print()
+    print(
+        f"{RED}คุณกำลังจะลบ AUTH ทั้งหมด "
+        f"{len(userpass)} รายการ{RESET}"
+    )
 
-        88 | 8)
-            clear
-            reboot
-            ;;
+    confirm = input("พิมพ์ DELETE เพื่อยืนยัน: ").strip()
 
-        99 | 9)
-            clear
-            hys_uninstaller
-            exit
-            ;;
+    if confirm != "DELETE":
+        print(f"{YELLOW}ยกเลิก{RESET}")
+        return
 
-        00 | 0)
-            clear
-            exit
-            ;;
+    if not backup_config():
+        return
 
-        *)
-            clear
-            menu
-            ;;
+    config["auth"]["userpass"] = {}
 
-    esac
-}
+    if save_config(config):
 
-while [[ $? -eq 0 ]]; do
-    menu
-done
+        print()
+        print(f"{GREEN}ลบ AUTH ทั้งหมดแล้ว ✓{RESET}")
+
+        restart_service()
+
+
+# ==============================
+# Restart Hysteria
+# ==============================
+
+def restart_service():
+
+    print()
+    print(f"{YELLOW}กำลังตรวจสอบ config...{RESET}")
+
+    # ตรวจสอบ JSON ก่อน
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            json.load(f)
+
+    except Exception as e:
+        print(f"{RED}JSON ไม่ถูกต้อง: {e}{RESET}")
+        return
+
+    print(f"{GREEN}JSON OK ✓{RESET}")
+
+    print(f"{YELLOW}กำลัง restart Hysteria...{RESET}")
+
+    result = subprocess.run(
+        ["systemctl", "restart", "hysteria"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if result.returncode != 0:
+
+        print(f"{RED}Restart ไม่สำเร็จ ✗{RESET}")
+
+        if result.stderr:
+            print(result.stderr.strip())
+
+        return
+
+    status = subprocess.run(
+        ["systemctl", "is-active", "hysteria"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if status.stdout.strip() == "active":
+
+        print(f"{GREEN}Hysteria ทำงานปกติ ✓{RESET}")
+
+    else:
+
+        print(f"{RED}Hysteria ไม่ได้ทำงาน ✗{RESET}")
+
+        subprocess.run(
+            ["systemctl", "status", "hysteria", "--no-pager", "-l"]
+        )
+
+
+# ==============================
+# Main menu
+# ==============================
+
+def menu():
+
+    while True:
+
+        header()
+
+        config = load_config()
+
+        userpass = get_userpass(config)
+
+        print(f"{CYAN}========== Hysteria Password Manager =========={RESET}")
+        print()
+
+        print(
+            f"  จำนวน AUTH: "
+            f"{GREEN}{len(userpass)}{RESET}"
+        )
+
+        print()
+
+        print("  1. เพิ่มรหัสผ่าน AUTH")
+        print("  2. ดูรหัสผ่าน AUTH")
+        print("  3. ลบรหัสผ่าน AUTH")
+        print("  4. ลบรหัสผ่านทั้งหมด")
+        print("  5. รีสตาร์ท Hysteria")
+        print("  0. ออก")
+
+        print()
+        print("================================================")
+        print()
+
+        choice = input("เลือกเมนู: ").strip()
+
+        if choice == "1":
+
+            add_password()
+
+        elif choice == "2":
+
+            list_passwords()
+
+        elif choice == "3":
+
+            delete_password()
+
+        elif choice == "4":
+
+            delete_all()
+
+        elif choice == "5":
+
+            restart_service()
+
+        elif choice == "0":
+
+            print("ออกจากโปรแกรม")
+            break
+
+        else:
+
+            print(f"{RED}ตัวเลือกไม่ถูกต้อง{RESET}")
+
+        input("\nกด Enter เพื่อกลับเมนู...")
+
+
+# ==============================
+# Run
+# ==============================
+
+if __name__ == "__main__":
+
+    check_root()
+    menu()
