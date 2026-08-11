@@ -1,880 +1,894 @@
-#!/usr/bin/env bash
-#
-# hysteria2.sh - อัปเกรดจาก install_server.sh ต้นฉบับ
-# ฟีเจอร์: ติดตั้ง/ถอน/อัปเดต + เพิ่ม-ลบผู้ใช้ + จำกัด IP + จำกัดวันหมดอายุ + เมนูภาษาไทย
-#
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2023 Aperture Internet Laboratory
-# Thai Mod + User Manager: Custom Build
+#!/bin/bash
+# ============================================================
+# 🚀 HYSTERIA2 MANAGER SCRIPT (THAI EDITION) - UDP PROXY
+# ✅ รองรับทุกเวอร์ชัน Hysteria2 | พอร์ต 10000-65000
+# ✅ จัดการผู้ใช้: Auth/Obfs Password, วันหมดอายุ, จำกัด IP/CIDR
+# ✅ ระบบเมนูแบบ Modular เรียกใช้ฟังก์ชันแยกหมวดชัดเจน
+# ============================================================
 
-set -e
-
-
-### ============================================================
-### 🔧 การตั้งค่า (จาก install_server.sh ต้นฉบับ ไม่แก้ไข)
-### ============================================================
-SCRIPT_NAME="$(basename "$0")"
-SCRIPT_ARGS=("$@")
-
-EXECUTABLE_INSTALL_PATH="/usr/local/bin/hysteria"
-SYSTEMD_SERVICES_DIR="/etc/systemd/system"
-CONFIG_DIR="/etc/hysteria"
-CONFIG_FILE="${CONFIG_DIR}/config.yaml"
-REPO_URL="https://github.com/apernet/hysteria"
-HY2_API_BASE_URL="https://api.hy2.io/v1"
-CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
-
-# ➕ เพิ่มสำหรับระบบผู้ใช้
-USER_DB="${CONFIG_DIR}/users.db"
-AUTH_HELPER="${CONFIG_DIR}/auth.sh"
-ACL_FILE="${CONFIG_DIR}/acl.txt"
-CRON_FILE="/etc/cron.d/hysteria-expire"
-
-PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
-OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
-ARCHITECTURE="${ARCHITECTURE:-}"
-HYSTERIA_USER="${HYSTERIA_USER:-}"
-HYSTERIA_HOME_DIR="${HYSTERIA_HOME_DIR:-}"
-SECONTEXT_SYSTEMD_UNIT="${SECONTEXT_SYSTEMD_UNIT:-}"
-
-OPERATION=""
-VERSION=""
-FORCE=""
-LOCAL_FILE=""
-
-
-### ============================================================
-### 🎨 ยูทิลิตี้ + สี (แปลงเป็นไทย)
-### ============================================================
-has_command() { type -P "$1" > /dev/null 2>&1; }
-curl() { command curl "${CURL_FLAGS[@]}" "$@"; }
-mktemp() { command mktemp "$@" "/tmp/hyservinst.XXXXXXXXXX"; }
-
-tput() { has_command tput && command tput "$@" || true; }
-tred() { tput setaf 1; }; tgreen() { tput setaf 2; }; tyellow() { tput setaf 3; }
-tblue() { tput setaf 4; }; taoi() { tput setaf 6; }; tbold() { tput bold; }
-treset() { tput sgr0; }
-
-msg()     { echo -e "$(tbold)$*$(treset)"; }
-ok()      { echo -e " $(tgreen)✓$(treset) $*"; }
-warn()    { echo -e " $(tyellow)⚠$(treset) $*"; }
-fail()    { echo -e " $(tred)✗$(treset) $*"; }
-error()   { echo -e "$SCRIPT_NAME: $(tred)❌ ข้อผิดพลาด:$(treset) $*" >&2; }
-note()    { echo -e "$SCRIPT_NAME: $(tbold)📝 หมายเหตุ:$(treset) $*"; }
-line()    { echo "─────────────────────────────────────────────"; }
-pause()   { read -rp "กด Enter เพื่อกลับเมนูหลัก... " _; }
-
-has_prefix() {
-  [[ -z "$2" ]] && return 0
-  [[ -z "$1" ]] && return 1
-  [[ "x$1" != "x${1#"$2"}" ]]
-}
-
-generate_random_password() {
-  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '/+=' | head -c 16
-}
-
-systemctl() {
-  if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]] || ! has_command systemctl; then
-    warn "ข้ามคำสั่ง systemd: systemctl $*"; return
-  fi
-  command systemctl "$@"
-}
-
-chcon() {
-  if ! has_command chcon || [[ "x$FORCE_NO_SELINUX" == "x1" ]]; then return; fi
-  command chcon "$@"
-}
-
-show_help() {
-  echo
-  msg "🔧 hysteria2.sh - วิธีใช้งาน"
-  echo
-  echo "  🖥️  เปิดเมนูแบบตอบโต้ (แนะนำ):"
-  echo "     sudo bash $SCRIPT_NAME"
-  echo
-  echo "  ⚡ เรียกคำสั่งโดยตรง:"
-  echo "     sudo bash $SCRIPT_NAME install    ติดตั้ง/อัปเดต Hysteria 2"
-  echo "     sudo bash $SCRIPT_NAME remove     ถอนการติดตั้ง"
-  echo "     sudo bash $SCRIPT_NAME check      ตรวจสอบเวอร์ชัน"
-  echo "     sudo bash $SCRIPT_NAME add        เพิ่มผู้ใช้"
-  echo "     sudo bash $SCRIPT_NAME del        ลบผู้ใช้"
-  echo "     sudo bash $SCRIPT_NAME list       ดูรายชื่อ"
-  echo "     sudo bash $SCRIPT_NAME ip         จำกัด IP"
-  echo "     sudo bash $SCRIPT_NAME expire     ตั้งวันหมดอายุ"
-  echo "     sudo bash $SCRIPT_NAME apply      นำไปใช้งาน + รีสตาร์ท"
-  echo "     sudo bash $SCRIPT_NAME status     สถานะบริการ"
-  echo
-  exit 0
-}
-
-
-### ============================================================
-### 🔐 สิทธิ์ / OS / สถาปัตยกรรม / systemd (จากต้นฉบับ เก็บไว้เหมือนเดิม)
-### ============================================================
-exec_sudo() {
-  local _saved_ifs="$IFS"; IFS=$'\n'
-  local _preserved_env=(
-    $(env | grep "^PACKAGE_MANAGEMENT_INSTALL=" || true)
-    $(env | grep "^OPERATING_SYSTEM=" || true)
-    $(env | grep "^ARCHITECTURE=" || true)
-    $(env | grep "^HYSTERIA_\w*=" || true)
-    $(env | grep "^SECONTEXT_SYSTEMD_UNIT=" || true)
-    $(env | grep "^FORCE_\w*=" || true)
-  )
-  IFS="$_saved_ifs"
-  exec sudo env "${_preserved_env[@]}" "$@"
-}
-
-rerun_with_sudo() {
-  has_command sudo || return 13
-  local _target_script="$0"
-  if has_prefix "$0" "/dev/" || has_prefix "$0" "/proc/"; then
-    _target_script="$(mktemp)"; chmod +x "$_target_script"
-    if has_command curl;      then curl -o "$_target_script" 'https://get.hy2.sh/'
-    elif has_command wget;    then wget -O "$_target_script" 'https://get.hy2.sh'
-    else return 127; fi
-  fi
-  note "กำลังรันซ้ำด้วยสิทธิ์ sudo..."
-  exec_sudo "$_target_script" "${SCRIPT_ARGS[@]}"
-}
-
-check_permission() {
-  [[ "$UID" -eq '0' ]] && return
-  note "ผู้ใช้ปัจจุบันไม่ใช่ root"
-  case "$FORCE_NO_ROOT" in
-    '1') warn "FORCE_NO_ROOT=1 ดำเนินการต่อ (อาจผิดพลาด)"; ;;
-    *)   rerun_with_sudo || { error "รันด้วย sudo หรือระบุ FORCE_NO_ROOT=1"; exit 13; } ;;
-  esac
-}
-
-detect_package_manager() {
-  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
-  if has_command apt;     then apt update; PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install'; return 0; fi
-  if has_command dnf;     then PACKAGE_MANAGEMENT_INSTALL='dnf -y install'; return 0; fi
-  if has_command yum;     then PACKAGE_MANAGEMENT_INSTALL='yum -y install'; return 0; fi
-  if has_command zypper;  then PACKAGE_MANAGEMENT_INSTALL='zypper install -y --no-install-recommends'; return 0; fi
-  if has_command pacman;  then PACKAGE_MANAGEMENT_INSTALL='pacman -Syu --noconfirm'; return 0; fi
-  return 1
-}
-
-install_software() {
-  local _p="$1"
-  detect_package_manager || { error "ไม่พบตัวจัดการแพ็กเกจ ติดตั้ง '$_p' เอง"; exit 65; }
-  echo "กำลังติดตั้ง $_p ..."
-  $PACKAGE_MANAGEMENT_INSTALL "$_p" >/dev/null && ok "ติดตั้ง $_p เสร็จ" || { error "ติดตั้ง $_p ไม่สำเร็จ"; exit 65; }
-}
-
-is_user_exists() { id "$1" >/dev/null 2>&1; }
-
-check_environment() {
-  if [[ -n "$OPERATING_SYSTEM" ]]; then warn "บังคับ OS=$OPERATING_SYSTEM"
-  else [[ "x$(uname)" == "xLinux" ]] || { error "รองรับเฉพาะ Linux"; exit 95; }; OPERATING_SYSTEM=linux; fi
-
-  if [[ -n "$ARCHITECTURE" ]]; then warn "บังคับ ARCH=$ARCHITECTURE"
-  else
-    case "$(uname -m)" in
-      i386|i686)         ARCHITECTURE=386 ;;
-      amd64|x86_64)      ARCHITECTURE=amd64 ;;
-      armv5*|armv6*|armv7*) ARCHITECTURE=arm ;;
-      armv8*|aarch64)    ARCHITECTURE=arm64 ;;
-      mips*|mips64*)     ARCHITECTURE=mipsle ;;
-      s390x)             ARCHITECTURE=s390x ;;
-      loongarch64)       ARCHITECTURE=loong64 ;;
-      *) error "สถาปัตยกรรม $(uname -m) ไม่รองรับ"; exit 8 ;;
-    esac
-  fi
-
-  if [[ ! -d "/run/systemd/system" ]] && ! grep -q systemd <(ls -l /sbin/init 2>/dev/null); then
-    case "$FORCE_NO_SYSTEMD" in
-      1) warn "FORCE_NO_SYSTEMD=1 ดำเนินการต่อ" ;;
-      2) warn "FORCE_NO_SYSTEMD=2 ข้าม systemd" ;;
-      *) error "ต้องการ Linux ที่ใช้ systemd"; exit 1 ;;
-    esac
-  fi
-
-  has_command curl || install_software curl
-  has_command grep || install_software grep
-  has_command jq   || install_software jq
-}
-
-get_systemd_version() {
-  has_command systemctl || return
-  command systemctl --version 2>/dev/null | head -1 | cut -d' ' -f2
-}
-
-systemd_unit_working_directory() {
-  local v="$(get_systemd_version || true)"
-  if [[ -n "$v" && "$v" -lt "227" ]]; then echo "$HYSTERIA_HOME_DIR"; return; fi
-  echo "~"
-}
-
-get_selinux_context() {
-  local _f="$1" _r="$(ls -dZ "$_f" 2>/dev/null | head -1)"
-  case "$(echo "$_r" | wc -w)" in
-    2) echo "$_r" | cut -d' ' -f1 ;;
-    5) echo "$_r" | cut -d' ' -f4 ;;
-    *) echo "" ;;
-  esac
-}
-
-check_hysteria_user() {
-  [[ -n "$HYSTERIA_USER" ]] && return
-  if [[ -e "$SYSTEMD_SERVICES_DIR/hysteria-server.service" ]]; then
-    HYSTERIA_USER="$(grep -oP '^User=\K\w+' "$SYSTEMD_SERVICES_DIR/hysteria-server.service" 2>/dev/null || true)"
-  fi
-  : "${HYSTERIA_USER:=$1}"
-}
-
-check_hysteria_homedir() {
-  [[ -n "$HYSTERIA_HOME_DIR" ]] && return
-  if is_user_exists "$HYSTERIA_USER"; then HYSTERIA_HOME_DIR="$(eval echo ~"$HYSTERIA_USER")"
-  else HYSTERIA_HOME_DIR="$1"; fi
-}
-
-
-### ============================================================
-### 📦 เปรียบเทียบเวอร์ชัน / ดาวน์โหลด (จากต้นฉบับ เก็บเหมือนเดิม)
-### ============================================================
-vercmp_segment() {
-  local l="$1" r="$2"
-  [[ "x$l" == "x$r" ]] && { echo 0; return; }
-  [[ -z "$l" ]] && { echo -1; return; }
-  [[ -z "$r" ]] && { echo 1; return; }
-  local ln="${l//[A-Za-z]*/}" rn="${r//[A-Za-z]*/}"
-  [[ "x$ln" == "x$rn" ]] || { echo $((10#$ln - 10#$rn)); return; }
-  local ls="${l#"$ln"}" rs="${r#"$rn"}"
-  [[ "x$ls" == "x$rs" ]] && { echo 0; return; }
-  [[ -z "$ls" ]] && { echo 1; return; }
-  [[ -z "$rs" ]] && { echo -1; return; }
-  [[ "$ls" < "$rs" ]] && echo -1 || echo 1
-}
-
-vercmp() {
-  local l="${1#v}" r="${2#v}"
-  while [[ -n "$l" && -n "$r" ]]; do
-    local cl="${l/.*/}" cr="${r/.*/}" sc="$(vercmp_segment "$cl" "$cr")"
-    [[ "$sc" -ne 0 ]] && { echo "$sc"; return; }
-    l="${l#"$cl"}"; l="${l#.}"; r="${r#"$cr"}"; r="${r#.}"
-  done
-  [[ "x$l" == "x$r" ]] && echo 0 || { [[ -z "$l" ]] && echo -1 || echo 1; }
-}
-
-is_hysteria_installed() { [[ -f "$EXECUTABLE_INSTALL_PATH" || -h "$EXECUTABLE_INSTALL_PATH" ]]; }
-is_hysteria1_version() { has_prefix "$1" "v1." || has_prefix "$1" "v0."; }
-
-get_installed_version() {
-  is_hysteria_installed || return
-  if "$EXECUTABLE_INSTALL_PATH" version >/dev/null 2>&1; then
-    "$EXECUTABLE_INSTALL_PATH" version | grep -oP '^Version\s+\Kv[\d.]+'
-  elif "$EXECUTABLE_INSTALL_PATH" -v >/dev/null 2>&1; then
-    "$EXECUTABLE_INSTALL_PATH" -v | awk '{print $3}'
-  fi
-}
-
-get_latest_version() {
-  [[ -n "$VERSION" ]] && { echo "$VERSION"; return; }
-  local tmp="$(mktemp)"
-  if ! curl -sS "$HY2_API_BASE_URL/update?cver=thai&plat=${OPERATING_SYSTEM}&arch=${ARCHITECTURE}&chan=release&side=server" -o "$tmp"; then
-    error "ไม่สามารถเรียก Hysteria API ได้"; exit 11
-  fi
-  local lv="$(grep -oP '"lver"\s*:\s*"\Kv[^"]+' "$tmp" | head -1)"
-  rm -f "$tmp"
-  [[ -n "$lv" ]] && echo "$lv" || { error "ไม่พบเวอร์ชันล่าสุด"; exit 11; }
-}
-
-download_hysteria() {
-  local ver="$1" out="$2"
-  local url="$REPO_URL/releases/download/app/$ver/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
-  echo "🔽 ดาวน์โหลด $url"
-  curl -R -H 'Cache-Control: no-cache' "$url" -o "$out" || { error "ดาวน์โหลดล้มเหลว"; return 11; }
-  chmod +x "$out"
-}
-
-check_update() {
-  echo -n "   เวอร์ชันที่ติดตั้ง : "
-  local iv="$(get_installed_version)"
-  [[ -n "$iv" ]] && echo "$iv" || echo "(ยังไม่ติดตั้ง)"
-  echo -n "   เวอร์ชันล่าสุด     : "
-  local lv="$(get_latest_version)"
-  echo "$lv"; VERSION="$lv"
-  local c="$(vercmp "$iv" "$lv")"
-  [[ "$c" -lt 0 ]] && return 0 || return 1
-}
-
-
-### ============================================================
-### 👤 ระบบฐานข้อมูลผู้ใช้ (users.db) ใหม่
-###    รูปแบบ: user|pass|IP1,IP2|YYYY-MM-DD|note
-### ============================================================
-init_user_db() {
-  mkdir -p "$CONFIG_DIR"
-  [[ -f "$USER_DB" ]] || : > "$USER_DB"
-  chown -R "$HYSTERIA_USER":"$HYSTERIA_USER" "$CONFIG_DIR" 2>/dev/null || true
-  chmod 600 "$USER_DB" 2>/dev/null || true
-}
-user_exists()     { [[ -n "$1" ]] && grep -q "^${1}|" "$USER_DB" 2>/dev/null; }
-add_user_db()     { echo "$1|$2|$3|$4|$5" >> "$USER_DB"; }
-del_user_db()     { sed -i "/^${1}|/d" "$USER_DB"; }
-count_users()     { wc -l < "$USER_DB" | tr -d ' '; }
-get_user_field()  { awk -F'|' -v u="$1" -v i="$2" '$1==u {print $i; exit}' "$USER_DB"; }
-set_user_field()  {
-  awk -F'|' -v OFS='|' -v u="$1" -v i="$2" -v v="$3" '$1==u{$i=v} {print}' "$USER_DB" > "${USER_DB}.tmp"
-  mv "${USER_DB}.tmp" "$USER_DB"
-}
-
-
-### ============================================================
-### 🔑 Auth Helper (เช็ค รหัสผ่าน ✅ IP ✅ หมดอายุ ✅)
-### ============================================================
-build_auth_helper() {
-  cat > "$AUTH_HELPER" <<'AUTH_EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-DB="/etc/hysteria/users.db"
-LOG="/etc/hysteria/auth.log"
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
-
-[[ -z "${AUTH:-}" ]] && { log "AUTH ว่าง"; exit 1; }
-USER="${AUTH%%:*}"; PASS="${AUTH#*:}"
-[[ -z "$USER" || -z "$PASS" ]] && { log "AUTH ไม่ถูกต้อง"; exit 1; }
-
-LINE="$(grep "^${USER}|" "$DB" 2>/dev/null || true)"
-[[ -z "$LINE" ]] && { log "❌ ไม่พบ user=[$USER]"; exit 1; }
-IFS='|' read -r DB_U DB_P DB_IPS DB_EXP DB_NOTE <<< "$LINE"
-
-# 1) รหัสผ่าน
-[[ "$PASS" != "$DB_P" ]] && { log "❌ [$USER] รหัสผิด IP=${SRC_ADDR:-?}"; exit 1; }
-
-# 2) หมดอายุ
-if [[ -n "$DB_EXP" && "$DB_EXP" != "0000-00-00" ]]; then
-  [[ "$(date +%Y-%m-%d)" > "$DB_EXP" ]] && { log "⏰ [$USER] หมดอายุ $DB_EXP"; exit 1; }
+# ===================== ตรวจสอบสิทธิ์ root =====================
+if [[ $EUID -ne 0 ]]; then
+    echo -e "\033[1;31m❌ กรุณารันสคริปต์นี้ด้วยสิทธิ์ root (ใช้คำสั่ง: sudo su)\033[0m"
+    exit 1
 fi
 
-# 3) IP Whitelist
-if [[ -n "$DB_IPS" ]]; then
-  SIP="${SRC_ADDR%:*}"; SIP="${SIP#[}"; SIP="${SIP%]}"
-  OK=0
-  IFS=',' read -ra IPL <<< "$DB_IPS"
-  for IP in "${IPL[@]}"; do
-    [[ -z "$IP" ]] && continue
-    if [[ "$IP" == */* ]] && command -v grepcidr >/dev/null; then
-      echo "$SIP" | grepcidr "$IP" >/dev/null 2>&1 && { OK=1; break; }
-    else
-      [[ "$SIP" == "$IP" ]] && { OK=1; break; }
+# ===================== ตัวแปรระบบ =====================
+HYSTERIA_DIR="/etc/hysteria"
+HYSTERIA_CONFIG="$HYSTERIA_DIR/config.yaml"
+HYSTERIA_USERS="$HYSTERIA_DIR/users.json"
+HYSTERIA_BIN="/usr/local/bin/hysteria"
+HYSTERIA_SERVICE="/etc/systemd/system/hysteria-server.service"
+HYSTERIA_LOG="/var/log/hysteria"
+HYSTERIA_ACL="$HYSTERIA_DIR/acl.conf"
+MIN_PORT=10000
+MAX_PORT=65000
+
+# ===================== สีข้อความ =====================
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
+CYAN='\033[1;36m'
+NC='\033[0m'
+
+# ============================================================
+# 🛠️ ฟังก์ชันช่วยเหลือทั่วไป
+# ============================================================
+print_banner() {
+    clear
+    echo -e "${CYAN}"
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║          🚀 HYSTERIA2 MANAGER - UDP PROXY               ║"
+    echo "║     รองรับทุกเวอร์ชัน | พอร์ต 10000-65000 | ไทย         ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+check_dependencies() {
+    echo -e "${YELLOW}🔍 กำลังตรวจสอบและติดตั้งแพ็กเกจที่จำเป็น...${NC}"
+    if command -v apt-get &> /dev/null; then
+        apt-get update -qq && apt-get install -y -qq curl wget jq openssl qrencode cron iptables > /dev/null 2>&1
+    elif command -v dnf &> /dev/null; then
+        dnf install -y -q curl wget jq openssl qrencode cronie iptables > /dev/null 2>&1
+    elif command -v yum &> /dev/null; then
+        yum install -y -q curl wget jq openssl qrencode cronie iptables > /dev/null 2>&1
     fi
-  done
-  [[ "$OK" -ne 1 ]] && { log "🚫 [$USER] IP=$SIP ไม่อยู่ใน [$DB_IPS]"; exit 1; }
-fi
-
-log "✅ [$USER] เข้าสู่ระบบ IP=${SRC_ADDR:-?} exp=$DB_EXP"
-echo "$USER"; exit 0
-AUTH_EOF
-  chmod +x "$AUTH_HELPER"
-  chown "$HYSTERIA_USER":"$HYSTERIA_USER" "$AUTH_HELPER" 2>/dev/null || true
+    echo -e "${GREEN}✅ ติดตั้งแพ็กเกจเสร็จสิ้น${NC}"
 }
 
-
-### ============================================================
-### ⚙️ สร้าง config.yaml / ACL / systemd / cron
-### ============================================================
-install_content() {
-  local _f="$1" _c="$2" _d="$3" _o="$4" _t="$(mktemp)"
-  echo -ne "ติดตั้ง $_d ... "
-  echo "$_c" > "$_t"
-  if [[ -z "$_o" && -e "$_d" ]]; then echo "มีอยู่แล้ว"
-  elif install "$_f" "$_t" "$_d"; then echo "เสร็จ"; fi
-  rm -f "$_t"
+random_port() {
+    echo $((RANDOM % (MAX_PORT - MIN_PORT + 1) + MIN_PORT))
 }
 
-tpl_server_svc() {
-  cat <<EOF
+generate_password() {
+    openssl rand -base64 16 | tr -d '/+=' | cut -c1-16
+}
+
+is_valid_date() {
+    date -d "$1" "+%Y-%m-%d" > /dev/null 2>&1
+    return $?
+}
+
+is_valid_ip_cidr() {
+    local ip=$1
+    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# ============================================================
+# 🚀 ฟังก์ชันติดตั้ง Hysteria2 (รองรับทุกเวอร์ชัน)
+# ============================================================
+install_hysteria() {
+    print_banner
+    if [[ -f "$HYSTERIA_BIN" ]]; then
+        echo -e "${YELLOW}⚠️  Hysteria2 ติดตั้งอยู่แล้วในระบบ${NC}"
+        read -p "ต้องการติดตั้งซ้ำ / อัปเดตเวอร์ชันหรือไม่? (y/N): " choice
+        [[ "$choice" != "y" && "$choice" != "Y" ]] && return
+    fi
+
+    check_dependencies
+
+    # เลือกเวอร์ชัน
+    echo ""
+    echo -e "${CYAN}📌 เลือกเวอร์ชัน Hysteria2 ที่จะติดตั้ง:${NC}"
+    echo " 1) เวอร์ชันล่าสุด (แนะนำ)"
+    echo " 2) ระบุเวอร์ชันเอง (เช่น v2.5.0, v2.4.5, v2.0.0)"
+    read -p "กรุณาเลือก [1-2]: " ver_choice
+
+    if [[ "$ver_choice" == "2" ]]; then
+        read -p "ป้อนเวอร์ชันที่ต้องการ (ตัวอย่าง: v2.5.0): " VERSION
+        [[ -z "$VERSION" ]] && { echo -e "${RED}❌ ไม่ได้ระบุเวอร์ชัน${NC}"; sleep 1; return; }
+    else
+        VERSION=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r '.tag_name')
+        [[ -z "$VERSION" || "$VERSION" == "null" ]] && { echo -e "${RED}❌ ไม่สามารถดึงเวอร์ชันล่าสุดได้ กรุณาเลือกระบุเอง${NC}"; sleep 1; return; }
+    fi
+    echo -e "${BLUE}ℹ️  กำลังติดตั้ง Hysteria2 เวอร์ชัน: ${YELLOW}$VERSION${NC}"
+
+    # ตรวจสอบสถาปัตยกรรมเซิร์ฟเวอร์
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64|amd64) ARCH="amd64" ;;
+        aarch64|arm64) ARCH="arm64" ;;
+        armv7l) ARCH="arm" ;;
+        *) echo -e "${RED}❌ สถาปัตยกรรม $ARCH ไม่รองรับ${NC}"; sleep 1; return ;;
+    esac
+
+    # ดาวน์โหลดไฟล์ไบนารี
+    DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/${VERSION}/hysteria-linux-${ARCH}"
+    echo -e "${YELLOW}⬇️  กำลังดาวน์โหลดจาก GitHub...${NC}"
+    wget -q --show-progress -O "$HYSTERIA_BIN" "$DOWNLOAD_URL" || { 
+        echo -e "${RED}❌ ดาวน์โหลดล้มเหลว! ตรวจสอบเวอร์ชันหรืออินเทอร์เน็ต${NC}"; sleep 1; return; 
+    }
+    chmod +x "$HYSTERIA_BIN"
+
+    # สร้างไดเรกทอรีเก็บไฟล์ระบบ
+    mkdir -p "$HYSTERIA_DIR" "$HYSTERIA_LOG"
+
+    # กำหนดพอร์ต
+    read -p "ป้อนพอร์ต UDP (เว้นว่างเพื่อสุ่มในช่วง 10000-65000): " PORT
+    [[ -z "$PORT" ]] && PORT=$(random_port)
+    while ! [[ "$PORT" =~ ^[0-9]+$ && "$PORT" -ge $MIN_PORT && "$PORT" -le $MAX_PORT ]]; do
+        echo -e "${RED}❌ พอร์ตไม่ถูกต้อง กรุณาป้อนตัวเลขระหว่าง $MIN_PORT - $MAX_PORT${NC}"
+        read -p "ป้อนพอร์ต UDP ใหม่: " PORT
+    done
+
+    # สร้างใบรับรอง SSL แบบลงชื่อเอง (อายุ 100 ปี)
+    openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+        -keyout "$HYSTERIA_DIR/server.key" -out "$HYSTERIA_DIR/server.crt" \
+        -days 36500 -subj "/CN=www.bing.com" > /dev/null 2>&1
+
+    # สร้างฐานข้อมูลผู้ใช้เริ่มต้น
+    echo '[]' > "$HYSTERIA_USERS"
+
+    # สร้างไฟล์กฎ ACL เริ่มต้น
+    echo "# ACL Rule - จำกัด IP ผู้ใช้งาน Hysteria2" > "$HYSTERIA_ACL"
+    echo "allow all" >> "$HYSTERIA_ACL"
+
+    # สร้างไฟล์ config.yaml
+    build_config
+
+    # สร้าง Systemd Service ให้เริ่มอัตโนมัติ
+    cat > "$HYSTERIA_SERVICE" << EOF
 [Unit]
-Description=Hysteria 2 Server (ภาษาไทย)
-After=network.target nss-lookup.target
+Description=Hysteria2 Server Service (UDP QUIC)
+After=network.target
+
 [Service]
 Type=simple
-ExecStart=$EXECUTABLE_INSTALL_PATH server --config $CONFIG_FILE
-WorkingDirectory=$(systemd_unit_working_directory)
-User=$HYSTERIA_USER
-Group=$HYSTERIA_USER
-Environment=HYSTERIA_LOG_LEVEL=info
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-NoNewPrivileges=true
+User=root
+ExecStart=$HYSTERIA_BIN server --config $HYSTERIA_CONFIG
 Restart=on-failure
-RestartSec=5s
+RestartSec=5
+LimitNOFILE=infinity
+
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    # เปิดพอร์ตในไฟร์วอลล์อัตโนมัติ
+    open_firewall "$PORT"
+
+    # เริ่มบริการและตั้งให้เริ่มต้นร่วมกับระบบ
+    systemctl daemon-reload
+    systemctl enable --now hysteria-server > /dev/null 2>&1
+
+    # ตั้ง Cron Job ตรวจสอบผู้ใช้หมดอายุอัตโนมัติ ทุกวันเวลา 00:00 น.
+    (crontab -l 2>/dev/null | grep -v "hysteria-expire"; 
+     echo "0 0 * * * /usr/local/bin/hysteria2-manager.sh expire > /dev/null 2>&1") | crontab -
+
+    # สร้างคำสั่งลัดเรียกใช้เมนู
+    SCRIPT_PATH=$(realpath "$0")
+    ln -sf "$SCRIPT_PATH" /usr/local/bin/hysteria2-manager 2>/dev/null
+
+    sleep 1
+    # ตรวจสอบว่าบริการทำงานหรือไม่
+    if systemctl is-active --quiet hysteria-server; then
+        echo ""
+        echo -e "${GREEN}══════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}✅ ติดตั้ง Hysteria2 เสร็จสิ้นสมบูรณ์!${NC}"
+        echo -e "${BLUE}📡 พอร์ต UDP: ${YELLOW}$PORT${NC}"
+        echo -e "${BLUE}💻 เวอร์ชันที่ติดตั้ง: ${YELLOW}$VERSION${NC}"
+        echo -e "${BLUE}💾 ไฟล์ตั้งค่า: ${YELLOW}$HYSTERIA_CONFIG${NC}"
+        echo -e "${CYAN}💡 พิมพ์คำสั่ง ${YELLOW}hysteria2-manager${CYAN} เพื่อเข้าเมนูจัดการ${NC}"
+        echo -e "${GREEN}══════════════════════════════════════════════${NC}"
+    else
+        echo -e "${RED}❌ บริการไม่สามารถเริ่มได้! กรุณาตรวจสอบ Log ด้านล่าง${NC}"
+        journalctl -u hysteria-server -n 20 --no-pager
+    fi
+    echo ""
+    read -n 1 -s -r -p "กดปุ่มใดๆ เพื่อกลับเมนู..."
 }
 
-tpl_server_x_svc() {
-  cat <<EOF
-[Unit]
-Description=Hysteria 2 Server (%i)
-After=network.target nss-lookup.target
-[Service]
-Type=simple
-ExecStart=$EXECUTABLE_INSTALL_PATH server --config ${CONFIG_DIR}/%i.yaml
-WorkingDirectory=$(systemd_unit_working_directory)
-User=$HYSTERIA_USER
-Group=$HYSTERIA_USER
-Environment=HYSTERIA_LOG_LEVEL=info
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-NoNewPrivileges=true
-Restart=on-failure
-[Install]
-WantedBy=multi-user.target
-EOF
-}
+# ============================================================
+# ⚙️ ฟังก์ชันสร้าง Config & ACL จากฐานผู้ใช้อัตโนมัติ
+# ============================================================
+build_config() {
+    local PORT AUTH_LIST OBFUSCATION=""
 
-tpl_config_yaml() {
-  local D E
-  D="$(grep -oP '^\s+-\s+\K\S+' "$CONFIG_FILE" 2>/dev/null | head -1)"
-  E="$(grep -oP 'email:\s+\K\S+' "$CONFIG_FILE" 2>/dev/null | head -1)"
-  : "${D:=your.domain.net}"; : "${E:=your@email.com}"
-  cat <<CFG
-# Hysteria 2 Config - สร้างโดย hysteria2.sh
-# จัดการผู้ใช้ผ่านเมนู → ห้ามแก้ไขส่วน auth ด้วยตัวเอง!
+    # ดึงพอร์ตจาก config เดิมถ้ามี
+    if [[ -f "$HYSTERIA_CONFIG" ]]; then
+        PORT=$(grep -oP 'listen: :\K[0-9]+' "$HYSTERIA_CONFIG" 2>/dev/null)
+    fi
+    [[ -z "$PORT" ]] && PORT=$(random_port)
 
-# listen: :443
+    # สร้างรายการ Auth Password จากผู้ใช้ที่เปิดใช้และยังไม่หมดอายุ
+    local today_ts=$(date -d "$(date '+%Y-%m-%d')" '+%s')
+    AUTH_LIST=$(jq -r --argjson today "$today_ts" '
+        .[] | select(
+            .enabled == true and 
+            (.expire == "" or .expire == null or 
+             ((.expire | strptime("%Y-%m-%d") | mktime) >= $today))
+        ) | "    - \(.auth_password)"
+    ' "$HYSTERIA_USERS" 2>/dev/null)
+    
+    # ถ้าไม่มีผู้ใช้เลย สร้างรหัสชั่วคราว
+    if [[ -z "$AUTH_LIST" ]]; then
+        local temp_pass=$(generate_password)
+        AUTH_LIST="    - $temp_pass"
+    fi
 
-acme:
-  domains:
-    - $D
-  email: $E
+    # ใช้ Obfuscation Password จากผู้ใช้แรกที่กำหนดไว้
+    OBF_PASS=$(jq -r '[.[] | select(.enabled == true and .obfs_password != "" and .obfs_password != null)][0].obfs_password' "$HYSTERIA_USERS" 2>/dev/null)
+    if [[ -n "$OBF_PASS" && "$OBF_PASS" != "null" ]]; then
+        OBFUSCATION="obfs:
+  type: salamander
+  password: \"$OBF_PASS\""
+    fi
+
+    # เขียนไฟล์ config.yaml ใหม่ทุกครั้ง
+    cat > "$HYSTERIA_CONFIG" << EOF
+# ==============================================
+# ไฟล์ตั้งค่าอัตโนมัติ - ห้ามแก้ไขด้วยตัวเอง!
+# ใช้เมนู hysteria2-manager จัดการแทน
+# ==============================================
+listen: :$PORT
+
+tls:
+  cert: $HYSTERIA_DIR/server.crt
+  key: $HYSTERIA_DIR/server.key
 
 auth:
-  type: command
-  command: "$AUTH_HELPER"
+  type: password
+  password:
+$AUTH_LIST
+
+$OBFUSCATION
 
 acl:
-  file: $ACL_FILE
+  file: $HYSTERIA_ACL
+
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 33554432
+  initConnReceiveWindow: 67108864
+  maxConnReceiveWindow: 134217728
+  maxIdleTimeout: 60s
+  keepAlivePeriod: 10s
+  disablePathMTUDiscovery: false
+
+bandwidth:
+  up: 1 gbps
+  down: 1 gbps
+
+udpIdleTimeout: 120s
 
 masquerade:
   type: proxy
   proxy:
-    url: https://news.ycombinator.com/
+    url: https://www.bing.com
     rewriteHost: true
+EOF
 
-bandwidth:
-  up: 1000 mbps
-  down: 1000 mbps
+    # สร้างกฎ ACL สำหรับจำกัด IP
+    build_acl
 
-udpIdleTimeout: 300s
-CFG
-}
-
-tpl_acl() {
-  cat <<'ACL'
-# Hysteria 2 ACL
-reject(10.0.0.0/8)
-reject(172.16.0.0/12)
-reject(192.168.0.0/16)
-reject(127.0.0.0/8)
-reject(169.254.0.0/16)
-reject(fd00::/8)
-reject(::1/128)
-reject(fe80::/10)
-reject(all, tcp/22)
-reject(all, tcp/25)
-reject(all, tcp/23)
-direct(all)
-ACL
-}
-
-build_all_configs() {
-  init_user_db
-  build_auth_helper
-  mkdir -p "$CONFIG_DIR"
-  install_content -Dm640 "$(tpl_config_yaml)"  "$CONFIG_FILE" "1"
-  install_content -Dm644 "$(tpl_acl)"          "$ACL_FILE"    "1"
-  install_content -Dm644 "$(tpl_server_svc)"   "$SYSTEMD_SERVICES_DIR/hysteria-server.service" "1"
-  install_content -Dm644 "$(tpl_server_x_svc)" "$SYSTEMD_SERVICES_DIR/hysteria-server@.service" "1"
-  if [[ -n "$SECONTEXT_SYSTEMD_UNIT" ]]; then
-    chcon "$SECONTEXT_SYSTEMD_UNIT" "$SYSTEMD_SERVICES_DIR/hysteria-server.service" 2>/dev/null || true
-    chcon "$SECONTEXT_SYSTEMD_UNIT" "$SYSTEMD_SERVICES_DIR/hysteria-server@.service" 2>/dev/null || true
-  fi
-  systemctl daemon-reload
-
-  # cron หมดอายุอัตโนมัติ
-  cat > "$CRON_FILE" <<CRON
-0 3 * * * root [ -f $USER_DB ] && sed -i -E '/\|([0-9]{4}-[0-9]{2}-[0-9]{2})\$/ { s/^/EXPIRED_/; }' $USER_DB 2>/dev/null; systemctl restart hysteria-server >/dev/null 2>&1 || true
-CRON
-  chmod 644 "$CRON_FILE"
-  systemctl restart cron >/dev/null 2>&1 || systemctl restart crond >/dev/null 2>&1 || true
-
-  chown -R "$HYSTERIA_USER":"$HYSTERIA_USER" "$CONFIG_DIR" 2>/dev/null || true
-  ok "สร้างไฟล์การตั้งค่าทั้งหมดเสร็จ"
-}
-
-apply_changes() {
-  build_all_configs
-  if is_hysteria_installed; then
-    msg "🔄 รีสตาร์ทบริการ..."
-    if systemctl restart hysteria-server 2>/dev/null; then
-      ok "รีสตาร์ทสำเร็จ"
-      sleep 1
-      systemctl is-active --quiet hysteria-server && ok "บริการปกติ ✅" || warn "ยังไม่ขึ้น → journalctl -u hysteria-server -f"
-    else
-      warn "รีสตาร์ทไม่ได้ → systemctl enable --now hysteria-server"
+    # รีสตาร์ทบริการถ้าทำงานอยู่ เพื่อให้ค่าใหม่ใช้งาน
+    if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+        systemctl restart hysteria-server > /dev/null 2>&1
     fi
-  else
-    note "ยังไม่ติดตั้ง binary → เมนู 1"
-  fi
 }
 
+build_acl() {
+    echo "# =============================================" > "$HYSTERIA_ACL"
+    echo "# Auto-generated ACL - ห้ามแก้ไขด้วยตัวเอง!" >> "$HYSTERIA_ACL"
+    echo "# กฎจำกัด IP ผู้ใช้งาน Hysteria2" >> "$HYSTERIA_ACL"
+    echo "# =============================================" >> "$HYSTERIA_ACL"
+    echo "" >> "$HYSTERIA_ACL"
 
-### ============================================================
-### 🧑‍🤝‍🧑 เมนูจัดการผู้ใช้ (4 ฟีเจอร์ที่คุณขอ)
-### ============================================================
-input_required() {
-  local v=""
-  while [[ -z "$v" ]]; do
-    read -rp "   $1 " v
-    v="${v:-${2:-}}"
-    [[ -z "$v" && -z "$2" ]] && fail "ห้ามเว้นว่าง"
-  done
-  echo "$v"
-}
-valid_date() {
-  [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
-  date -d "$1" "+%Y-%m-%d" >/dev/null 2>&1
-}
+    # ดึงผู้ใช้ที่เปิดใช้และมีการจำกัด IP
+    local has_restrict=false
+    jq -c '.[] | select(.enabled == true and .allowed_ips != null and (.allowed_ips | length) > 0)' "$HYSTERIA_USERS" 2>/dev/null | while read -r user; do
+        has_restrict=true
+        local u ips
+        u=$(echo "$user" | jq -r '.username')
+        ips=$(echo "$user" | jq -r '.allowed_ips[]')
+        echo "# -------- ผู้ใช้: $u --------" >> "$HYSTERIA_ACL"
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] && echo "allow ip $ip" >> "$HYSTERIA_ACL"
+        done <<< "$ips"
+        echo "" >> "$HYSTERIA_ACL"
+    done
 
-list_simple() {
-  echo "   ผู้ใช้ปัจจุบัน:"
-  while IFS='|' read -r u _ _ e _; do
-    [[ -z "$u" ]] && continue
-    [[ "$e" == "0000-00-00" ]] && e="ไม่จำกัด"
-    echo "     • $u  (หมดอายุ: $e)"
-  done < "$USER_DB"
-}
-
-menu_add() {
-  line; msg "➕ เพิ่มผู้ใช้ใหม่"
-  local u p ips exp note
-  while :; do
-    u="$(input_required "ชื่อผู้ใช้ (ภาษาอังกฤษ): ")"
-    user_exists "$u" && fail "มีชื่อนี้อยู่แล้ว" || break
-  done
-  p="$(input_required "รหัสผ่าน (Enter = สุ่ม): " "$(generate_random_password)")"
-  read -rp "   IP ที่อนุญาต (คั่นด้วย , เว้นว่าง = ไม่จำกัด): " ips; ips="${ips// /}"
-  while :; do
-    read -rp "   วันหมดอายุ (YYYY-MM-DD / 0 = ไม่หมด): " exp
-    exp="${exp:-0}"
-    [[ "$exp" == "0" ]] && { exp="0000-00-00"; break; }
-    valid_date "$exp" && break || fail "รูปแบบผิด เช่น $(date -d '+30 days' +%Y-%m-%d)"
-  done
-  read -rp "   หมายเหตุ: " note
-
-  add_user_db "$u" "$p" "$ips" "$exp" "$note"
-  line; ok "เพิ่ม [$u] เสร็จ"
-  echo "   👤 User: $u   🔑 Pass: $p"
-  [[ -n "$ips" ]] && echo "   🌐 IP: $ips" || echo "   🌐 IP: ไม่จำกัด"
-  [[ "$exp" == "0000-00-00" ]] && echo "   ⏰ หมดอายุ: ไม่มีกำหนด" || echo "   ⏰ หมดอายุ: $exp"
-  echo "   🔗 URI: hysteria2://${u}:${p}@โดเมนคุณ:443/?sni=โดเมนคุณ#${u}"
-  echo
-  read -rp "นำไปใช้งานทันที? (Y/n): " a
-  [[ "${a,,}" != "n" ]] && apply_changes
-  pause
+    # ถ้ามีผู้ใช้ที่จำกัด IP → บล็อกทุก IP อื่นๆ, ถ้าไม่มี → อนุญาตทุก IP
+    local restrict_count
+    restrict_count=$(jq '[.[] | select(.allowed_ips != null and (.allowed_ips | length) > 0)] | length' "$HYSTERIA_USERS" 2>/dev/null)
+    if [[ "$restrict_count" -gt 0 ]]; then
+        echo "# บล็อกทุก IP ที่ไม่อยู่ในรายการอนุญาต" >> "$HYSTERIA_ACL"
+        echo "block all" >> "$HYSTERIA_ACL"
+    else
+        echo "# ไม่มีการจำกัด IP → อนุญาตทุกการเชื่อมต่อ" >> "$HYSTERIA_ACL"
+        echo "allow all" >> "$HYSTERIA_ACL"
+    fi
 }
 
-menu_del() {
-  line; msg "🗑️  ลบผู้ใช้"
-  [[ "$(count_users)" -eq 0 ]] && { warn "ยังไม่มีผู้ใช้"; pause; return; }
-  list_simple
-  local u="$(input_required "ชื่อผู้ใช้ที่จะลบ: ")"
-  user_exists "$u" || { fail "ไม่พบ [$u]"; pause; return; }
-  read -rp "   พิมพ์ YES เพื่อยืนยันลบ [$u]: " ans
-  [[ "$ans" == "YES" ]] || { warn "ยกเลิก"; pause; return; }
-  del_user_db "$u"; ok "ลบ [$u] เสร็จ"
-  read -rp "นำไปใช้งานทันที? (Y/n): " a
-  [[ "${a,,}" != "n" ]] && apply_changes
-  pause
+# ============================================================
+# 🔥 ฟังก์ชันเปิดพอร์ตในไฟร์วอลล์ (UFW / Firewalld / iptables)
+# ============================================================
+open_firewall() {
+    local port=$1
+    echo -e "${YELLOW}🔥 กำลังเปิดพอร์ต UDP $port ในไฟร์วอลล์...${NC}"
+    if command -v ufw &> /dev/null; then
+        ufw allow "$port/udp" > /dev/null 2>&1
+    elif command -v firewall-cmd &> /dev/null; then
+        firewall-cmd --permanent --add-port="$port/udp" > /dev/null 2>&1
+        firewall-cmd --reload > /dev/null 2>&1
+    else
+        iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null
+        mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4 2>/dev/null
+    fi
 }
 
-menu_list() {
-  line
-  local n="$(count_users)"
-  msg "📋 รายชื่อผู้ใช้ทั้งหมด ($n คน)"
-  [[ "$n" -eq 0 ]] && { echo "   (ว่างเปล่า)"; pause; return; }
-  printf "   %-3s %-14s %-14s %-20s %-12s %s\n" "ที่" "User" "Password" "IP" "หมดอายุ" "Note"
-  printf "   %-3s %-14s %-14s %-20s %-12s %s\n" "───" "────────────" "────────────" "────────────────────" "────────────" "──────────"
-  local i=0
-  while IFS='|' read -r u p ips e nt; do
-    [[ -z "$u" ]] && continue; ((i++))
-    [[ "$e" == "0000-00-00" ]] && e="ไม่จำกัด"
-    [[ -z "$ips" ]] && ips="ไม่จำกัด"
-    [[ "$e" != "ไม่จำกัด" ]] && valid_date "$e" && [[ "$(date +%Y-%m-%d)" > "$e" ]] && e="❌ $e"
-    printf "   %-3s %-14s %-14s %-20s %-12s %s\n" "$i" "$u" "$p" "${ips:0:20}" "$e" "${nt:0:18}"
-  done < "$USER_DB"
-  echo; pause
+# ============================================================
+# 👤 ฟังก์ชันจัดการผู้ใช้ทั้งหมด
+# ============================================================
+
+# ---------------- เพิ่มผู้ใช้ใหม่ ----------------
+add_user() {
+    print_banner
+    echo -e "${CYAN}➕ เพิ่มผู้ใช้ใหม่${NC}"
+    echo "─────────────────────────────────────────────"
+
+    read -p "👤 ชื่อผู้ใช้ (Username): " username
+    [[ -z "$username" ]] && { echo -e "${RED}❌ กรุณาป้อนชื่อผู้ใช้${NC}"; sleep 1; return; }
+
+    # ตรวจสอบว่ามีผู้ใช้นี้อยู่แล้วหรือไม่
+    local exists
+    exists=$(jq --arg u "$username" '.[] | select(.username == $u)' "$HYSTERIA_USERS")
+    [[ -n "$exists" ]] && { echo -e "${RED}❌ มีชื่อผู้ใช้นี้อยู่แล้วในระบบ${NC}"; sleep 1; return; }
+
+    # กำหนด Auth Password
+    local default_auth=$(generate_password)
+    read -p "🔑 Auth Password (เว้นว่างสุ่มอัตโนมัติ: $default_auth): " auth_pass
+    [[ -z "$auth_pass" ]] && auth_pass=$default_auth
+
+    # กำหนด Obfuscation Password
+    local default_obfs=$(generate_password)
+    read -p "🔐 Obfuscation Password (เว้นว่างสุ่มอัตโนมัติ: $default_obfs): " obfs_pass
+    [[ -z "$obfs_pass" ]] && obfs_pass=$default_obfs
+
+    # กำหนดวันหมดอายุ
+    local expire=""
+    read -p "📅 วันหมดอายุ (รูปแบบ YYYY-MM-DD, เว้นว่าง=ไม่หมดอายุ): " expire_input
+    if [[ -n "$expire_input" ]]; then
+        while ! is_valid_date "$expire_input"; do
+            echo -e "${RED}❌ รูปแบบวันที่ไม่ถูกต้อง!${NC}"
+            read -p "📅 ป้อนใหม่ (YYYY-MM-DD): " expire_input
+            [[ -z "$expire_input" ]] && break
+        done
+        [[ -n "$expire_input" ]] && expire=$(date -d "$expire_input" "+%Y-%m-%d")
+    fi
+
+    # กำหนด IP ที่อนุญาตเชื่อมต่อ
+    local ips_json="[]"
+    read -p "🌐 จำกัด IP/CIDR (คั่นด้วยช่องว่าง, เว้นว่าง=ไม่จำกัด): " ips_input
+    if [[ -n "$ips_input" ]]; then
+        local valid_ips=()
+        for ip in $ips_input; do
+            if is_valid_ip_cidr "$ip"; then
+                valid_ips+=("$ip")
+            else
+                echo -e "${YELLOW}⚠️  ข้าม IP รูปแบบไม่ถูกต้อง: $ip${NC}"
+            fi
+        done
+        if [[ ${#valid_ips[@]} -gt 0 ]]; then
+            ips_json=$(printf '%s\n' "${valid_ips[@]}" | jq -R . | jq -s .)
+        fi
+    fi
+
+    # เพิ่มข้อมูลลงฐานข้อมูล JSON
+    jq --arg u "$username" \
+       --arg a "$auth_pass" \
+       --arg o "$obfs_pass" \
+       --arg e "$expire" \
+       --argjson i "$ips_json" \
+       '. += [{
+           "username": $u,
+           "auth_password": $a,
+           "obfs_password": $o,
+           "expire": $e,
+           "allowed_ips": $i,
+           "enabled": true,
+           "created": "'$(date '+%Y-%m-%d %H:%M:%S')'"
+       }]' "$HYSTERIA_USERS" > "$HYSTERIA_USERS.tmp" && mv "$HYSTERIA_USERS.tmp" "$HYSTERIA_USERS"
+
+    # อัปเดต Config + รีสตาร์ทบริการ
+    build_config
+
+    # แสดงข้อมูลผู้ใช้ + URL เชื่อมต่อ + QR Code
+    local port server_ip
+    port=$(grep -oP 'listen: :\K[0-9]+' "$HYSTERIA_CONFIG")
+    server_ip=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+    local hy_url="hy2://$auth_pass@$server_ip:$port/?obfs=salamander&obfs-password=$obfs_pass&insecure=1#$username"
+
+    echo ""
+    echo -e "${GREEN}══════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}✅ เพิ่มผู้ใช้เสร็จสิ้น!${NC}"
+    echo -e "${BLUE}👤 ชื่อผู้ใช้: ${YELLOW}$username${NC}"
+    echo -e "${BLUE}🔑 Auth Pass: ${YELLOW}$auth_pass${NC}"
+    echo -e "${BLUE}🔐 Obfs Pass: ${YELLOW}$obfs_pass${NC}"
+    echo -e "${BLUE}📅 หมดอายุ: ${YELLOW}${expire:-ไม่จำกัด}${NC}"
+    echo -e "${BLUE}🌐 IP อนุญาต: ${YELLOW}${ips_input:-ทุก IP}${NC}"
+    echo -e "${BLUE}📡 URL เชื่อมต่อ:${NC}"
+    echo -e "${CYAN}$hy_url${NC}"
+    echo ""
+    if command -v qrencode &> /dev/null; then
+        echo -e "${BLUE}📱 QR Code (สแกนใช้งานได้เลย):${NC}"
+        qrencode -t ANSIUTF8 "$hy_url"
+    fi
+    echo -e "${GREEN}══════════════════════════════════════════════${NC}"
+
+    echo ""
+    read -n 1 -s -r -p "กดปุ่มใดๆ เพื่อกลับเมนู..."
 }
 
-menu_ip() {
-  line; msg "🌐 จำกัด IP ต่อผู้ใช้"
-  [[ "$(count_users)" -eq 0 ]] && { warn "ยังไม่มีผู้ใช้"; pause; return; }
-  list_simple
-  local u="$(input_required "เลือก User: ")"
-  user_exists "$u" || { fail "ไม่พบ [$u]"; pause; return; }
-  local old="$(get_user_field "$u" 3)"; [[ -z "$old" ]] && old="(ไม่จำกัด)"
-  echo "   IP ปัจจุบัน: $old"
-  read -rp "   IP ใหม่ (, คั่น / เว้นว่าง = ไม่จำกัด / CIDR ได้): " ips; ips="${ips// /}"
-  set_user_field "$u" 3 "$ips"
-  [[ -z "$ips" ]] && ok "เปิดให้ทุก IP" || ok "ตั้ง IP = $ips"
-  read -rp "นำไปใช้งานทันที? (Y/n): " a
-  [[ "${a,,}" != "n" ]] && apply_changes
-  pause
+# ---------------- แสดงรายการผู้ใช้ทั้งหมด ----------------
+list_users() {
+    print_banner
+    echo -e "${CYAN}📋 รายการผู้ใช้ทั้งหมดในระบบ${NC}"
+    echo "─────────────────────────────────────────────────────────────────────────────────────"
+
+    if [[ ! -f "$HYSTERIA_USERS" || $(jq 'length' "$HYSTERIA_USERS") -eq 0 ]]; then
+        echo -e "${YELLOW}⚠️  ยังไม่มีผู้ใช้ในระบบ กรุณาเพิ่มผู้ใช้ก่อน${NC}"
+        echo ""
+        read -n 1 -s -r -p "กดปุ่มใดๆ เพื่อกลับเมนู..."
+        return
+    fi
+
+    local today=$(date '+%Y-%m-%d')
+    printf "${BLUE}%-4s %-16s %-12s %-14s %-12s %-18s %s${NC}\n" \
+        "ลำดับ" "ชื่อผู้ใช้" "สถานะ" "วันหมดอายุ" "จำกัด IP" "Auth Password" "Obfs Password"
+    printf "%-4s %-16s %-12s %-14s %-12s %-18s %s\n" \
+        "----" "----------------" "------------" "--------------" "------------" "------------------" "------------------"
+
+    local idx=0
+    jq -c '.[]' "$HYSTERIA_USERS" | while read -r user; do
+        idx=$((idx+1))
+        local u e enabled status ip_count auth obfs expire_ts today_ts
+        u=$(echo "$user" | jq -r '.username')
+        e=$(echo "$user" | jq -r '.expire')
+        enabled=$(echo "$user" | jq -r '.enabled')
+        ip_count=$(echo "$user" | jq -r '.allowed_ips | length')
+        auth=$(echo "$user" | jq -r '.auth_password')
+        obfs=$(echo "$user" | jq -r '.obfs_password')
+
+        # ตรวจสอบสถานะ
+        if [[ "$enabled" != "true" ]]; then
+            status="${RED}ปิดใช้${NC}"
+        elif [[ -n "$e" && "$e" != "null" ]]; then
+            expire_ts=$(date -d "$e" '+%s')
+            today_ts=$(date -d "$today" '+%s')
+            if [[ $expire_ts -lt $today_ts ]]; then
+                status="${RED}หมดอายุ${NC}"
+            else
+                status="${GREEN}ใช้งาน${NC}"
+            fi
+        else
+            status="${GREEN}ใช้งาน${NC}"
+        fi
+
+        local ip_text
+        [[ "$ip_count" -gt 0 ]] && ip_text="${YELLOW}$ip_count รายการ${NC}" || ip_text="${GREEN}ไม่จำกัด${NC}"
+
+        printf "%-4s %-16s %b %-14s %b %-18s %s\n" \
+            "$idx" "$u" "$status" "${e:-ไม่จำกัด}" "$ip_text" "${auth:0:16}" "${obfs:0:16}"
+    done
+
+    echo "─────────────────────────────────────────────────────────────────────────────────────"
+    echo -e "${BLUE}📊 สรุป: ${YELLOW}$(jq 'length' "$HYSTERIA_USERS") ${BLUE}รายการ${NC}"
+    echo ""
+    read -n 1 -s -r -p "กดปุ่มใดๆ เพื่อกลับเมนู..."
 }
 
-menu_expire() {
-  line; msg "⏰ ตั้ง/แก้ไขวันหมดอายุ"
-  [[ "$(count_users)" -eq 0 ]] && { warn "ยังไม่มีผู้ใช้"; pause; return; }
-  list_simple
-  local u="$(input_required "เลือก User: ")"
-  user_exists "$u" || { fail "ไม่พบ [$u]"; pause; return; }
-  local old="$(get_user_field "$u" 4)"; [[ "$old" == "0000-00-00" ]] && old="ไม่มีกำหนด"
-  echo "   หมดอายุปัจจุบัน: $old"
-  echo "   💡 เช่น +30 วัน = $(date -d '+30 days' +%Y-%m-%d)  |  +1 ปี = $(date -d '+1 year' +%Y-%m-%d)"
-  local exp
-  while :; do
-    read -rp "   วันใหม่ (YYYY-MM-DD / 0 = ไม่หมด): " exp
-    exp="${exp:-0}"
-    [[ "$exp" == "0" ]] && { exp="0000-00-00"; break; }
-    valid_date "$exp" && break || fail "รูปแบบผิด"
-  done
-  set_user_field "$u" 4 "$exp"
-  [[ "$exp" == "0000-00-00" ]] && ok "ตั้งเป็นไม่หมดอายุ" || ok "ตั้งหมดอายุ = $exp"
-  read -rp "นำไปใช้งานทันที? (Y/n): " a
-  [[ "${a,,}" != "n" ]] && apply_changes
-  pause
-}
+# ---------------- แก้ไขข้อมูลผู้ใช้ ----------------
+edit_user() {
+    print_banner
+    echo -e "${CYAN}✏️  แก้ไขข้อมูลผู้ใช้${NC}"
+    echo "─────────────────────────────────────────────"
 
+    if [[ $(jq 'length' "$HYSTERIA_USERS") -eq 0 ]]; then
+        echo -e "${YELLOW}⚠️  ยังไม่มีผู้ใช้ในระบบ${NC}"
+        sleep 1
+        return
+    fi
 
-### ============================================================
-### 🚀 ติดตั้ง / ถอน / อัปเดต / สถานะ (ปรับจาก install_server.sh)
-### ============================================================
-get_running_services() {
-  [[ "x$FORCE_NO_SYSTEMD" == "x2" ]] && return
-  systemctl list-units --state=active --plain --no-legend 2>/dev/null \
-    | grep -o "hysteria-server@*[^\s]*.service" || true
-}
-restart_running() {
-  [[ "x$FORCE_NO_SYSTEMD" == "x2" ]] && return
-  for s in $(get_running_services); do
-    echo -n "รีสตาร์ท $s ... "
-    systemctl restart "$s" && echo "เสร็จ" || echo "ผิดพลาด"
-  done
-}
-stop_running() {
-  [[ "x$FORCE_NO_SYSTEMD" == "x2" ]] && return
-  for s in $(get_running_services); do
-    echo -n "หยุด $s ... "
-    systemctl stop "$s" && echo "เสร็จ" || echo "ผิดพลาด"
-  done
-}
+    read -p "👤 ป้อนชื่อผู้ใช้ที่ต้องการแก้ไข: " username
+    local user_data
+    user_data=$(jq --arg u "$username" '.[] | select(.username == $u)' "$HYSTERIA_USERS")
+    [[ -z "$user_data" ]] && { echo -e "${RED}❌ ไม่พบผู้ใช้ชื่อ $username ในระบบ${NC}"; sleep 1; return; }
 
-perform_install_binary() {
-  if [[ -n "$LOCAL_FILE" ]]; then
-    note "ติดตั้งจากไฟล์: $LOCAL_FILE"
-    install -Dm755 "$LOCAL_FILE" "$EXECUTABLE_INSTALL_PATH" && ok "ติดตั้ง binary เสร็จ" || exit 2
-    return
-  fi
-  local tmp="$(mktemp)"
-  download_hysteria "$VERSION" "$tmp" || { rm -f "$tmp"; exit 11; }
-  install -Dm755 "$tmp" "$EXECUTABLE_INSTALL_PATH" && ok "ติดตั้ง Hysteria $VERSION เสร็จ" || exit 13
-  rm -f "$tmp"
-}
+    # ดึงค่าเดิมมาแสดง
+    local old_auth old_obfs old_expire old_ips old_enabled
+    old_auth=$(echo "$user_data" | jq -r '.auth_password')
+    old_obfs=$(echo "$user_data" | jq -r '.obfs_password')
+    old_expire=$(echo "$user_data" | jq -r '.expire')
+    old_ips=$(echo "$user_data" | jq -r '.allowed_ips | join(" ")')
+    old_enabled=$(echo "$user_data" | jq -r '.enabled')
 
-menu_install() {
-  line; msg "1️⃣  ติดตั้ง / อัปเดต Hysteria 2"
-  check_permission; check_environment
-  check_hysteria_user "hysteria"
-  check_hysteria_homedir "/var/lib/$HYSTERIA_USER"
-  if [[ -z "$SECONTEXT_SYSTEMD_UNIT" && -z "$FORCE_NO_SELINUX" ]] && has_command getenforce; then
-    note "ตรวจพบ SELinux"
-    [[ -e "$SYSTEMD_SERVICES_DIR" ]] && SECONTEXT_SYSTEMD_UNIT="$(get_selinux_context "$SYSTEMD_SERVICES_DIR")"
-    [[ -z "$SECONTEXT_SYSTEMD_UNIT" ]] && warn "อ่าน SELinux context ไม่ได้"
-  fi
+    echo ""
+    echo -e "${BLUE}💡 เว้นว่างทุกช่องเพื่อใช้ค่าเดิม${NC}"
+    echo "─────────────────────────────────────────────"
 
-  local fresh=0 up1=0 need=0
-  if ! is_hysteria_installed; then fresh=1
-  elif is_hysteria1_version "$(get_installed_version)"; then up1=1; fi
+    read -p "🔑 Auth Password ใหม่ [$old_auth]: " new_auth
+    [[ -z "$new_auth" ]] && new_auth=$old_auth
 
-  if [[ -n "$LOCAL_FILE" || -n "$VERSION" ]] || check_update; then need=1; fi
-  [[ "x$FORCE" == "x1" ]] && need=1
+    read -p "🔐 Obfuscation Password ใหม่ [$old_obfs]: " new_obfs
+    [[ -z "$new_obfs" ]] && new_obfs=$old_obfs
 
-  if is_hysteria1_version "$VERSION"; then error "ติดตั้งได้แค่ Hysteria 2"; exit 95; fi
-  [[ "$need" -eq 1 ]] && perform_install_binary
+    read -p "📅 วันหมดอายุใหม่ YYYY-MM-DD [${old_expire:-ไม่จำกัด}]: " new_expire
+    if [[ -n "$new_expire" ]]; then
+        while ! is_valid_date "$new_expire"; do
+            echo -e "${RED}❌ รูปแบบวันที่ไม่ถูกต้อง${NC}"
+            read -p "📅 ป้อนใหม่ (YYYY-MM-DD): " new_expire
+            [[ -z "$new_expire" ]] && break
+        done
+        [[ -n "$new_expire" ]] && new_expire=$(date -d "$new_expire" "+%Y-%m-%d")
+    else
+        new_expire=$old_expire
+    fi
 
-  if ! is_user_exists "$HYSTERIA_USER"; then
-    echo -n "สร้าง user $HYSTERIA_USER ... "
-    useradd -r -d "$HYSTERIA_HOME_DIR" -m -s /usr/sbin/nologin "$HYSTERIA_USER" 2>/dev/null && echo "OK" || echo "ข้าม"
-  fi
+    read -p "🌐 IP อนุญาตใหม่ (คั่นช่องว่าง) [${old_ips:-ไม่จำกัด}]: " new_ips_input
+    local new_ips_json
+    if [[ -n "$new_ips_input" ]]; then
+        local valid=()
+        for ip in $new_ips_input; do
+            is_valid_ip_cidr "$ip" && valid+=("$ip") || echo -e "${YELLOW}⚠️  ข้าม IP ไม่ถูกต้อง: $ip${NC}"
+        done
+        new_ips_json=$(printf '%s\n' "${valid[@]}" | jq -R . | jq -s .)
+    else
+        new_ips_json=$(echo "$user_data" | jq '.allowed_ips')
+    fi
 
-  build_all_configs
-  has_command apt && apt install -y grepcidr >/dev/null 2>&1 && ok "ติดตั้ง grepcidr (รองรับ CIDR)" || true
-
-  line
-  if [[ "$fresh" -eq 1 ]]; then
-    msg "🎉 ติดตั้งเสร็จสมบูรณ์!"
-    echo "   1) แก้ $CONFIG_FILE ใส่โดเมน+อีเมล ACME"
-    echo "   2) DNS ชี้ไปที่ VPS นี้ + เปิด UDP 443"
-    echo "   3) กลับเมนู → 4 เพิ่มผู้ใช้"
-    echo "   4) systemctl enable --now hysteria-server"
-  elif [[ "$up1" -eq 1 ]]; then
-    warn "อัปเกรดจาก v1 → v2 (โปรโตคอลไม่เข้ากัน ต้องสร้างผู้ใช้ใหม่)"
-  else
-    msg "✅ อัปเดตเป็น $VERSION เสร็จ"
-    restart_running
-  fi
-  pause
-}
-
-menu_remove() {
-  line; msg "2️⃣  ถอนการติดตั้งทั้งหมด"
-  read -rp "   ⚠ พิมพ์ DELETE เพื่อยืนยันลบทุกอย่าง: " ans
-  [[ "$ans" != "DELETE" ]] && { warn "ยกเลิก"; pause; return; }
-  stop_running
-  systemctl disable hysteria-server.service >/dev/null 2>&1 || true
-  rm -f "$EXECUTABLE_INSTALL_PATH"
-  rm -f "$SYSTEMD_SERVICES_DIR"/hysteria-server*.service
-  rm -f "$CRON_FILE"
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  read -rp "   ลบ config + ผู้ใช้ทั้งหมดด้วย? (y/N): " a
-  [[ "${a,,}" == "y" ]] && rm -rf "$CONFIG_DIR" && ok "ลบ $CONFIG_DIR เสร็จ"
-  read -rp "   ลบ user $HYSTERIA_USER ด้วย? (y/N): " a
-  [[ "${a,,}" == "y" && "$HYSTERIA_USER" != "root" ]] && userdel -r "$HYSTERIA_USER" 2>/dev/null && ok "ลบ user เสร็จ"
-  ok "ถอนการติดตั้งเสร็จ"; pause
-}
-
-menu_check() {
-  line; msg "3️⃣  ตรวจสอบเวอร์ชัน"
-  check_permission; check_environment
-  if check_update; then
-    msg "💡 มีเวอร์ชันใหม่!"
-    read -rp "   อัปเดตตอนนี้? (Y/n): " a
-    [[ "${a,,}" != "n" ]] && { FORCE=1 perform_install_binary; apply_changes; }
-  else ok "เป็นเวอร์ชันล่าสุดแล้ว ✅"; fi
-  pause
-}
-
-menu_status() {
-  line; msg "📊 สถานะบริการ"
-  is_hysteria_installed || { warn "ยังไม่ติดตั้ง → เมนู 1"; pause; return; }
-  echo "   เวอร์ชัน       : $(get_installed_version)"
-  echo "   ผู้ใช้ทั้งหมด : $(count_users) คน"
-  echo -n "   สถานะ         : "
-  if systemctl is-active --quiet hysteria-server 2>/dev/null; then
-    echo "$(tgreen)กำลังทำงาน ✅$(treset)"
-    echo -n "   เปิดอัตโนมัติ : "
-    systemctl is-enabled --quiet hysteria-server 2>/dev/null && echo "$(tgreen)เปิด$(treset)" || echo "$(tyellow)ยังไม่เปิด$(treset)"
-    echo; msg "Log ล่าสุด (10 บรรทัด):"
-    journalctl -u hysteria-server -n 10 --no-pager 2>/dev/null || warn "ดู log ไม่ได้"
-  else
-    echo "$(tred)หยุด ❌$(treset)  →  systemctl enable --now hysteria-server"
-  fi
-  pause
-}
-
-
-### ============================================================
-### 🧭 เมนูหลัก & ตัวแยกวิเคราะห์
-### ============================================================
-show_main_menu() {
-  clear
-  echo
-  msg "╔══════════════════════════════════════════╗"
-  msg "║   🚀 Hysteria 2 Manager (ภาษาไทย)        ║"
-  msg "╚══════════════════════════════════════════╝"
-  echo
-  echo "   $(tblue)0$(treset) 📖 คู่มือ / ช่วยเหลือ"
-  echo "   $(tblue)1$(treset) 🟢 ติดตั้ง / อัปเดต Hysteria 2"
-  echo "   $(tblue)2$(treset) 🔴 ถอนการติดตั้ง"
-  echo "   $(tblue)3$(treset) 🔍 ตรวจสอบเวอร์ชันอัปเดต"
-  echo
-  echo "   ─────────── 🧑‍🤝‍🧑 จัดการผู้ใช้ ───────────"
-  echo "   $(tgreen)4$(treset) ➕ เพิ่มผู้ใช้ (รหัสผ่าน + IP + หมดอายุ)"
-  echo "   $(tgreen)5$(treset) ➖ ลบผู้ใช้"
-  echo "   $(tgreen)6$(treset) 📋 แสดงรายชื่อทั้งหมด"
-  echo "   $(tgreen)7$(treset) 🌐 จำกัด IP ต่อผู้ใช้"
-  echo "   $(tgreen)8$(treset) ⏰ ตั้ง/แก้ไขวันหมดอายุ"
-  echo
-  echo "   ───────────── ⚙️ อื่นๆ ─────────────────"
-  echo "   $(taoi)9$(treset)  ♻️ บันทึกการเปลี่ยนแปลง + รีสตาร์ท"
-  echo "   $(taoi)10$(treset) 📊 สถานะบริการ & Log"
-  echo "   $(tred)00$(treset) 🚪 ออกจากโปรแกรม"
-  echo; line
-}
-
-main_menu() {
-  check_permission; check_environment
-  check_hysteria_user "hysteria"
-  check_hysteria_homedir "/var/lib/$HYSTERIA_USER"
-  init_user_db
-  while :; do
-    show_main_menu
-    read -rp "   เลือก [0-10 / 00=ออก]: " c
-    case "$c" in
-      0)  show_help ;;
-      1)  menu_install ;;
-      2)  menu_remove ;;
-      3)  menu_check ;;
-      4)  menu_add ;;
-      5)  menu_del ;;
-      6)  menu_list ;;
-      7)  menu_ip ;;
-      8)  menu_expire ;;
-      9)  apply_changes; pause ;;
-      10) menu_status ;;
-      00|q|Q|exit) msg "👋 ลาก่อน!"; exit 0 ;;
-      *) fail "เลือกไม่ถูกต้อง"; sleep 1.2 ;;
+    read -p "✅ เปิดใช้งานผู้ใช้หรือไม่? (y/N) [ปัจจุบัน: $old_enabled]: " en_choice
+    case "$en_choice" in
+        y|Y) new_enabled=true ;;
+        n|N) new_enabled=false ;;
+        *) new_enabled=$old_enabled ;;
     esac
-  done
+
+    # อัปเดตฐานข้อมูล
+    jq --arg u "$username" \
+       --arg a "$new_auth" \
+       --arg o "$new_obfs" \
+       --arg e "$new_expire" \
+       --argjson i "$new_ips_json" \
+       --argjson en "$new_enabled" \
+       'map(if .username == $u then
+           .auth_password=$a | .obfs_password=$o | .expire=$e | 
+           .allowed_ips=$i | .enabled=$en | .updated="'$(date '+%Y-%m-%d %H:%M:%S')'"
+       else . end)' "$HYSTERIA_USERS" > "$HYSTERIA_USERS.tmp" && mv "$HYSTERIA_USERS.tmp" "$HYSTERIA_USERS"
+
+    # อัปเดต Config
+    build_config
+    echo -e "\n${GREEN}✅ อัปเดตข้อมูลผู้ใช้ $username เสร็จสิ้น${NC}"
+    sleep 1
 }
 
-parse_arguments() {
-  [[ $# -eq 0 ]] && { main_menu; exit 0; }
-  case "$1" in
-    -h|--help|help)     show_help ;;
-    install)            OPERATION=install ;;
-    remove|uninstall)   OPERATION=remove ;;
-    check|update)       OPERATION=check ;;
-    add|adduser)        OPERATION=add ;;
-    del|rm|delete)      OPERATION=del ;;
-    list|ls|users)      OPERATION=list ;;
-    ip)                 OPERATION=ip ;;
-    expire|date)        OPERATION=expire ;;
-    apply|reload)       OPERATION=apply ;;
-    status|info)        OPERATION=status ;;
-    -f|--force)         FORCE=1; shift; parse_arguments "$@" ;;
-    --version)          VERSION="$2"; shift 2; parse_arguments "$@" ;;
-    -l|--local)         LOCAL_FILE="$2"; shift 2; parse_arguments "$@" ;;
-    *) error "คำสั่ง '$1' ไม่รู้จัก → $SCRIPT_NAME --help"; exit 22 ;;
-  esac
+# ---------------- ลบผู้ใช้ ----------------
+delete_user() {
+    print_banner
+    echo -e "${RED}🗑️  ลบผู้ใช้ออกจากระบบ${NC}"
+    echo "─────────────────────────────────────────────"
+
+    if [[ $(jq 'length' "$HYSTERIA_USERS") -eq 0 ]]; then
+        echo -e "${YELLOW}⚠️  ยังไม่มีผู้ใช้ในระบบ${NC}"
+        sleep 1
+        return
+    fi
+
+    read -p "👤 ป้อนชื่อผู้ใช้ที่ต้องการลบ: " username
+    local exists
+    exists=$(jq --arg u "$username" '.[] | select(.username == $u)' "$HYSTERIA_USERS")
+    [[ -z "$exists" ]] && { echo -e "${RED}❌ ไม่พบผู้ใช้ชื่อ $username${NC}"; sleep 1; return; }
+
+    read -p "❓ ยืนยันการลบผู้ใช้ ${YELLOW}$username${NC} ถาวร? (y/N): " confirm
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { echo -e "${YELLOW}ℹ️  ยกเลิกการลบ${NC}"; sleep 1; return; }
+
+    jq --arg u "$username" 'map(select(.username != $u))' "$HYSTERIA_USERS" > "$HYSTERIA_USERS.tmp" && mv "$HYSTERIA_USERS.tmp" "$HYSTERIA_USERS"
+    build_config
+    echo -e "${GREEN}✅ ลบผู้ใช้ $username เสร็จสิ้น${NC}"
+    sleep 1
 }
 
-main() {
-  parse_arguments "$@"
-  check_permission; check_environment
-  check_hysteria_user "hysteria"
-  check_hysteria_homedir "/var/lib/$HYSTERIA_USER"
-  init_user_db
-  case "$OPERATION" in
-    install) menu_install ;;
-    remove)  menu_remove ;;
-    check)   menu_check ;;
-    add)     menu_add ;;
-    del)     menu_del ;;
-    list)    menu_list ;;
-    ip)      menu_ip ;;
-    expire)  menu_expire ;;
-    apply)   apply_changes ;;
-    status)  menu_status ;;
-  esac
+# ---------------- แสดง URL/QR ผู้ใช้ ----------------
+show_user_detail() {
+    print_banner
+    echo -e "${CYAN}🔍 แสดงข้อมูลเชื่อมต่อผู้ใช้${NC}"
+    echo "─────────────────────────────────────────────"
+
+    if [[ $(jq 'length' "$HYSTERIA_USERS") -eq 0 ]]; then
+        echo -e "${YELLOW}⚠️  ยังไม่มีผู้ใช้ในระบบ${NC}"
+        sleep 1
+        return
+    fi
+
+    read -p "👤 ป้อนชื่อผู้ใช้: " username
+    local user
+    user=$(jq --arg u "$username" '.[] | select(.username == $u)' "$HYSTERIA_USERS")
+    [[ -z "$user" ]] && { echo -e "${RED}❌ ไม่พบผู้ใช้ชื่อ $username${NC}"; sleep 1; return; }
+
+    local auth obfs port server_ip
+    auth=$(echo "$user" | jq -r '.auth_password')
+    obfs=$(echo "$user" | jq -r '.obfs_password')
+    port=$(grep -oP 'listen: :\K[0-9]+' "$HYSTERIA_CONFIG")
+    server_ip=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+    local hy_url="hy2://$auth@$server_ip:$port/?obfs=salamander&obfs-password=$obfs&insecure=1#$username"
+
+    echo ""
+    echo -e "${GREEN}══════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}👤 ชื่อผู้ใช้: ${YELLOW}$username${NC}"
+    echo -e "${BLUE}🔑 Auth Pass: ${YELLOW}$auth${NC}"
+    echo -e "${BLUE}🔐 Obfs Pass: ${YELLOW}$obfs${NC}"
+    echo -e "${BLUE}📅 หมดอายุ: ${YELLOW}$(echo "$user" | jq -r '.expire // "ไม่จำกัด"')${NC}"
+    echo -e "${BLUE}🌐 IP อนุญาต: ${YELLOW}$(echo "$user" | jq -r '.allowed_ips | join(", ") // "ทุก IP"')${NC}"
+    echo -e "${BLUE}📌 สถานะ: ${YELLOW}$(echo "$user" | jq -r '.enabled')${NC}"
+    echo -e "${GREEN}══════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}📡 URL เชื่อมต่อ Hysteria2:${NC}"
+    echo -e "${CYAN}$hy_url${NC}"
+    echo ""
+    if command -v qrencode &> /dev/null; then
+        echo -e "${BLUE}📱 QR Code สำหรับมือถือ:${NC}"
+        qrencode -t ANSIUTF8 "$hy_url"
+    fi
+
+    echo ""
+    read -n 1 -s -r -p "กดปุ่มใดๆ เพื่อกลับเมนู..."
 }
 
-main "$@"
+# ============================================================
+# ⏰ ฟังก์ชันตรวจสอบผู้ใช้หมดอายุ (รันอัตโนมัติ + รันด้วยมือ)
+# ============================================================
+check_expire_users() {
+    local today=$(date '+%Y-%m-%d')
+    local today_ts=$(date -d "$today" '+%s')
+    local changed=false
+
+    echo -e "${CYAN}🔍 กำลังตรวจสอบผู้ใช้หมดอายุ...${NC}"
+    jq -c '.[] | select(.enabled == true and .expire != "" and .expire != null)' "$HYSTERIA_USERS" 2>/dev/null | while read -r user; do
+        local u exp exp_ts
+        u=$(echo "$user" | jq -r '.username')
+        exp=$(echo "$user" | jq -r '.expire')
+        exp_ts=$(date -d "$exp" '+%s')
+
+        if [[ $exp_ts -lt $today_ts ]]; then
+            echo -e "${RED}🔒 ปิดการใช้งาน: $u (หมดอายุเมื่อ $exp)${NC}"
+            jq --arg un "$u" 'map(if .username == $un then .enabled = false else . end)' "$HYSTERIA_USERS" > "$HYSTERIA_USERS.tmp" && mv "$HYSTERIA_USERS.tmp" "$HYSTERIA_USERS"
+            changed=true
+        fi
+    done
+
+    if [[ "$changed" == "true" ]]; then
+        build_config
+        echo -e "${GREEN}✅ อัปเดตสถานะผู้ใช้หมดอายุเสร็จสิ้น${NC}"
+    else
+        echo -e "${GREEN}✅ ไม่พบผู้ใช้ที่หมดอายุ${NC}"
+    fi
+}
+
+# ============================================================
+# ❌ ฟังก์ชันถอนการติดตั้ง Hysteria2 ทั้งหมด
+# ============================================================
+uninstall_hysteria() {
+    print_banner
+    echo -e "${RED}══════════════════════════════════════════════${NC}"
+    echo -e "${RED}⚠️  คำเตือน! กำลังจะลบ Hysteria2 ทั้งหมดออกจากระบบ${NC}"
+    echo -e "${RED}→ ไฟล์ตั้งค่า, ผู้ใช้, บริการทั้งหมดจะหายไปถาวร${NC}"
+    echo -e "${RED}══════════════════════════════════════════════${NC}"
+    read -p "❓ พิมพ์คำว่า ${YELLOW}YES${NC} เพื่อยืนยันการถอนการติดตั้ง: " confirm
+    [[ "$confirm" != "YES" ]] && { echo -e "${YELLOW}ℹ️  ยกเลิกการถอนการติดตั้ง${NC}"; sleep 1; return; }
+
+    echo -e "${YELLOW}🗑️  กำลังลบทุกอย่าง...${NC}"
+    systemctl stop hysteria-server > /dev/null 2>&1
+    systemctl disable hysteria-server > /dev/null 2>&1
+    rm -f "$HYSTERIA_SERVICE" "$HYSTERIA_BIN"
+    rm -rf "$HYSTERIA_DIR" "$HYSTERIA_LOG"
+    rm -f /usr/local/bin/hysteria2-manager
+    (crontab -l 2>/dev/null | grep -v "hysteria-expire") | crontab - 2>/dev/null
+    systemctl daemon-reload
+
+    echo -e "${GREEN}✅ ถอนการติดตั้ง Hysteria2 เสร็จสิ้นสมบูรณ์${NC}"
+    sleep 2
+    exit 0
+}
+
+# ============================================================
+# 📋 ระบบเมนูแบบ Modular (เรียกใช้ฟังก์ชันแยกหมวด)
+# ============================================================
+
+# ---------------- เมนูย่อย 1: จัดการผู้ใช้ ----------------
+menu_user_management() {
+    while true; do
+        print_banner
+        echo -e "${CYAN}👤 เมนูจัดการผู้ใช้ทั้งหมด${NC}"
+        echo "───────────────────────────────────"
+        echo " 1) ➕ เพิ่มผู้ใช้ใหม่"
+        echo " 2) 📋 แสดงรายการผู้ใช้ทั้งหมด"
+        echo " 3) ✏️  แก้ไขข้อมูลผู้ใช้"
+        echo " 4) 🔍 แสดง URL เชื่อมต่อ + QR Code"
+        echo " 5) 🗑️  ลบผู้ใช้ออกจากระบบ"
+        echo "───────────────────────────────────"
+        echo " 9) 🔙 ย้อนกลับเมนูหลัก"
+        echo " 0) 🚪 ออกจากโปรแกรม"
+        echo ""
+        read -p "กรุณาเลือกทำการ [0-9]: " choice
+
+        case "$choice" in
+            1) add_user ;;
+            2) list_users ;;
+            3) edit_user ;;
+            4) show_user_detail ;;
+            5) delete_user ;;
+            9) return ;;
+            0) clear; exit 0 ;;
+            *) echo -e "${RED}❌ ตัวเลือกไม่ถูกต้อง กรุณาเลือก 0-9${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ---------------- เมนูย่อย 2: จัดการบริการ & พอร์ต ----------------
+menu_service_management() {
+    while true; do
+        print_banner
+        echo -e "${CYAN}⚙️  เมนูจัดการบริการ & พอร์ต${NC}"
+        echo "───────────────────────────────────"
+        echo " 1) ▶️  เริ่มบริการ (Start)"
+        echo " 2) ⏹️  หยุดบริการ (Stop)"
+        echo " 3) 🔄 รีสตาร์ทบริการ (Restart)"
+        echo " 4) 📊 ตรวจสอบสถานะ + ดู Log ล่าสุด"
+        echo " 5) 🔌 เปลี่ยนพอร์ต UDP (10000-65000)"
+        echo "───────────────────────────────────"
+        echo " 9) 🔙 ย้อนกลับเมนูหลัก"
+        echo " 0) 🚪 ออกจากโปรแกรม"
+        echo ""
+        read -p "กรุณาเลือกทำการ [0-9]: " choice
+
+        case "$choice" in
+            1) 
+                systemctl start hysteria-server \
+                    && echo -e "${GREEN}✅ เริ่มบริการ Hysteria2 แล้ว${NC}" \
+                    || echo -e "${RED}❌ เริ่มบริการล้มเหลว${NC}"
+                sleep 1 ;;
+            2) 
+                systemctl stop hysteria-server \
+                    && echo -e "${GREEN}✅ หยุดบริการ Hysteria2 แล้ว${NC}" \
+                    || echo -e "${RED}❌ หยุดบริการล้มเหลว${NC}"
+                sleep 1 ;;
+            3) 
+                systemctl restart hysteria-server \
+                    && echo -e "${GREEN}✅ รีสตาร์ทบริการแล้ว${NC}" \
+                    || echo -e "${RED}❌ รีสตาร์ทล้มเหลว${NC}"
+                sleep 1 ;;
+            4) 
+                echo -e "${BLUE}📊 สถานะบริการ:${NC}"
+                systemctl status hysteria-server --no-pager
+                echo -e "\n${BLUE}📜 Log ล่าสุด 20 บรรทัด:${NC}"
+                journalctl -u hysteria-server -n 20 --no-pager
+                echo ""
+                read -n 1 -s -r -p "กดปุ่มใดๆ เพื่อกลับเมนู..."
+                ;;
+            5)
+                local old_port new_port
+                old_port=$(grep -oP 'listen: :\K[0-9]+' "$HYSTERIA_CONFIG")
+                read -p "ป้อนพอร์ตใหม่ [$MIN_PORT-$MAX_PORT] (ปัจจุบัน: $old_port): " new_port
+                while ! [[ "$new_port" =~ ^[0-9]+$ && "$new_port" -ge $MIN_PORT && "$new_port" -le $MAX_PORT ]]; do
+                    echo -e "${RED}❌ พอร์ตไม่ถูกต้อง!${NC}"
+                    read -p "ป้อนใหม่: " new_port
+                done
+                sed -i "s/listen: :$old_port/listen: :$new_port/" "$HYSTERIA_CONFIG"
+                open_firewall "$new_port"
+                systemctl restart hysteria-server
+                echo -e "${GREEN}✅ เปลี่ยนพอร์ตเป็น $new_port เสร็จสิ้น${NC}"
+                sleep 1
+                ;;
+            9) return ;;
+            0) clear; exit 0 ;;
+            *) echo -e "${RED}❌ ตัวเลือกไม่ถูกต้อง${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ---------------- เมนูย่อย 3: ระบบ & การติดตั้ง ----------------
+menu_system() {
+    while true; do
+        print_banner
+        echo -e "${CYAN}🖥️  เมนูระบบ & การติดตั้ง${NC}"
+        echo "───────────────────────────────────"
+        echo " 1) 🚀 ติดตั้ง / อัปเดต Hysteria2"
+        echo " 2) 🔍 ตรวจสอบผู้ใช้หมดอายุทันที"
+        echo " 3) ❌ ถอนการติดตั้ง Hysteria2 ทั้งหมด"
+        echo "───────────────────────────────────"
+        echo " 9) 🔙 ย้อนกลับเมนูหลัก"
+        echo " 0) 🚪 ออกจากโปรแกรม"
+        echo ""
+        read -p "กรุณาเลือกทำการ [0-9]: " choice
+
+        case "$choice" in
+            1) install_hysteria ;;
+            2) 
+                check_expire_users
+                echo ""
+                read -n 1 -s -r -p "กดปุ่มใดๆ เพื่อกลับ..."
+                ;;
+            3) uninstall_hysteria ;;
+            9) return ;;
+            0) clear; exit 0 ;;
+            *) echo -e "${RED}❌ ตัวเลือกไม่ถูกต้อง${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ---------------- 🏠 เมนูหลัก (กระจายการเรียกใช้ฟังก์ชัน) ----------------
+main_menu() {
+    # ถ้ายังไม่ติดตั้ง Hysteria2 → แสดงแค่ตัวเลือกติดตั้ง
+    if [[ ! -f "$HYSTERIA_BIN" ]]; then
+        while true; do
+            print_banner
+            echo -e "${YELLOW}⚠️  ยังไม่พบ Hysteria2 ในระบบ${NC}"
+            echo -e "${CYAN}กรุณาเลือกทำการ:${NC}"
+            echo " 1) 🚀 ติดตั้ง Hysteria2"
+            echo " 0) 🚪 ออกจากโปรแกรม"
+            echo ""
+            read -p "เลือก: " c
+            case "$c" in
+                1) install_hysteria; break ;;
+                0) clear; exit 0 ;;
+                *) echo -e "${RED}❌ ไม่ถูกต้อง${NC}"; sleep 1 ;;
+            esac
+        done
+    fi
+
+    # ✅ ลูปหลักของเมนู
+    while true; do
+        print_banner
+        echo -e "${CYAN}🏠 เมนูหลัก — Hysteria2 Manager${NC}"
+        echo "═══════════════════════════════════"
+        echo " 1) 👤 จัดการผู้ใช้ทั้งหมด"
+        echo " 2) ⚙️  จัดการบริการ & พอร์ต"
+        echo " 3) 🖥️  ระบบ / ติดตั้ง / ถอนการติดตั้ง"
+        echo "═══════════════════════════════════"
+        echo " 0) 🚪 ออกจากโปรแกรม"
+        echo ""
+        read -p "กรุณาเลือกหมวดทำการ [0-3]: " main_choice
+
+        case "$main_choice" in
+            1) menu_user_management ;;
+            2) menu_service_management ;;
+            3) menu_system ;;
+            0) clear; exit 0 ;;
+            *) echo -e "${RED}❌ กรุณาเลือก 0 - 3 เท่านั้น${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================
+# 🚀 จุดเริ่มต้นสคริปต์
+# ============================================================
+# ✅ ถ้ารันด้วยอาร์กิวเมนต์ "expire" → รันแค่ตรวจสอบหมดอายุ (ใช้สำหรับ Cron Job)
+if [[ "$1" == "expire" ]]; then
+    check_expire_users
+    exit 0
+fi
+
+# ✅ ปกติ → เรียกใช้เมนูหลัก
+main_menu
