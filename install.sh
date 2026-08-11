@@ -1,2836 +1,880 @@
-checkRoot() {
-    user=$(whoami)
+#!/usr/bin/env bash
+#
+# hysteria2.sh - อัปเกรดจาก install_server.sh ต้นฉบับ
+# ฟีเจอร์: ติดตั้ง/ถอน/อัปเดต + เพิ่ม-ลบผู้ใช้ + จำกัด IP + จำกัดวันหมดอายุ + เมนูภาษาไทย
+#
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2023 Aperture Internet Laboratory
+# Thai Mod + User Manager: Custom Build
 
-    if [ ! "${user}" = "root" ]; then
-        echo -e "\e[91mกรุณารันสคริปต์ด้วยผู้ใช้ root!\e[0m"
-        exit 1
+set -e
+
+
+### ============================================================
+### 🔧 การตั้งค่า (จาก install_server.sh ต้นฉบับ ไม่แก้ไข)
+### ============================================================
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_ARGS=("$@")
+
+EXECUTABLE_INSTALL_PATH="/usr/local/bin/hysteria"
+SYSTEMD_SERVICES_DIR="/etc/systemd/system"
+CONFIG_DIR="/etc/hysteria"
+CONFIG_FILE="${CONFIG_DIR}/config.yaml"
+REPO_URL="https://github.com/apernet/hysteria"
+HY2_API_BASE_URL="https://api.hy2.io/v1"
+CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
+
+# ➕ เพิ่มสำหรับระบบผู้ใช้
+USER_DB="${CONFIG_DIR}/users.db"
+AUTH_HELPER="${CONFIG_DIR}/auth.sh"
+ACL_FILE="${CONFIG_DIR}/acl.txt"
+CRON_FILE="/etc/cron.d/hysteria-expire"
+
+PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
+OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
+ARCHITECTURE="${ARCHITECTURE:-}"
+HYSTERIA_USER="${HYSTERIA_USER:-}"
+HYSTERIA_HOME_DIR="${HYSTERIA_HOME_DIR:-}"
+SECONTEXT_SYSTEMD_UNIT="${SECONTEXT_SYSTEMD_UNIT:-}"
+
+OPERATION=""
+VERSION=""
+FORCE=""
+LOCAL_FILE=""
+
+
+### ============================================================
+### 🎨 ยูทิลิตี้ + สี (แปลงเป็นไทย)
+### ============================================================
+has_command() { type -P "$1" > /dev/null 2>&1; }
+curl() { command curl "${CURL_FLAGS[@]}" "$@"; }
+mktemp() { command mktemp "$@" "/tmp/hyservinst.XXXXXXXXXX"; }
+
+tput() { has_command tput && command tput "$@" || true; }
+tred() { tput setaf 1; }; tgreen() { tput setaf 2; }; tyellow() { tput setaf 3; }
+tblue() { tput setaf 4; }; taoi() { tput setaf 6; }; tbold() { tput bold; }
+treset() { tput sgr0; }
+
+msg()     { echo -e "$(tbold)$*$(treset)"; }
+ok()      { echo -e " $(tgreen)✓$(treset) $*"; }
+warn()    { echo -e " $(tyellow)⚠$(treset) $*"; }
+fail()    { echo -e " $(tred)✗$(treset) $*"; }
+error()   { echo -e "$SCRIPT_NAME: $(tred)❌ ข้อผิดพลาด:$(treset) $*" >&2; }
+note()    { echo -e "$SCRIPT_NAME: $(tbold)📝 หมายเหตุ:$(treset) $*"; }
+line()    { echo "─────────────────────────────────────────────"; }
+pause()   { read -rp "กด Enter เพื่อกลับเมนูหลัก... " _; }
+
+has_prefix() {
+  [[ -z "$2" ]] && return 0
+  [[ -z "$1" ]] && return 1
+  [[ "x$1" != "x${1#"$2"}" ]]
+}
+
+generate_random_password() {
+  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '/+=' | head -c 16
+}
+
+systemctl() {
+  if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]] || ! has_command systemctl; then
+    warn "ข้ามคำสั่ง systemd: systemctl $*"; return
+  fi
+  command systemctl "$@"
+}
+
+chcon() {
+  if ! has_command chcon || [[ "x$FORCE_NO_SELINUX" == "x1" ]]; then return; fi
+  command chcon "$@"
+}
+
+show_help() {
+  echo
+  msg "🔧 hysteria2.sh - วิธีใช้งาน"
+  echo
+  echo "  🖥️  เปิดเมนูแบบตอบโต้ (แนะนำ):"
+  echo "     sudo bash $SCRIPT_NAME"
+  echo
+  echo "  ⚡ เรียกคำสั่งโดยตรง:"
+  echo "     sudo bash $SCRIPT_NAME install    ติดตั้ง/อัปเดต Hysteria 2"
+  echo "     sudo bash $SCRIPT_NAME remove     ถอนการติดตั้ง"
+  echo "     sudo bash $SCRIPT_NAME check      ตรวจสอบเวอร์ชัน"
+  echo "     sudo bash $SCRIPT_NAME add        เพิ่มผู้ใช้"
+  echo "     sudo bash $SCRIPT_NAME del        ลบผู้ใช้"
+  echo "     sudo bash $SCRIPT_NAME list       ดูรายชื่อ"
+  echo "     sudo bash $SCRIPT_NAME ip         จำกัด IP"
+  echo "     sudo bash $SCRIPT_NAME expire     ตั้งวันหมดอายุ"
+  echo "     sudo bash $SCRIPT_NAME apply      นำไปใช้งาน + รีสตาร์ท"
+  echo "     sudo bash $SCRIPT_NAME status     สถานะบริการ"
+  echo
+  exit 0
+}
+
+
+### ============================================================
+### 🔐 สิทธิ์ / OS / สถาปัตยกรรม / systemd (จากต้นฉบับ เก็บไว้เหมือนเดิม)
+### ============================================================
+exec_sudo() {
+  local _saved_ifs="$IFS"; IFS=$'\n'
+  local _preserved_env=(
+    $(env | grep "^PACKAGE_MANAGEMENT_INSTALL=" || true)
+    $(env | grep "^OPERATING_SYSTEM=" || true)
+    $(env | grep "^ARCHITECTURE=" || true)
+    $(env | grep "^HYSTERIA_\w*=" || true)
+    $(env | grep "^SECONTEXT_SYSTEMD_UNIT=" || true)
+    $(env | grep "^FORCE_\w*=" || true)
+  )
+  IFS="$_saved_ifs"
+  exec sudo env "${_preserved_env[@]}" "$@"
+}
+
+rerun_with_sudo() {
+  has_command sudo || return 13
+  local _target_script="$0"
+  if has_prefix "$0" "/dev/" || has_prefix "$0" "/proc/"; then
+    _target_script="$(mktemp)"; chmod +x "$_target_script"
+    if has_command curl;      then curl -o "$_target_script" 'https://get.hy2.sh/'
+    elif has_command wget;    then wget -O "$_target_script" 'https://get.hy2.sh'
+    else return 127; fi
+  fi
+  note "กำลังรันซ้ำด้วยสิทธิ์ sudo..."
+  exec_sudo "$_target_script" "${SCRIPT_ARGS[@]}"
+}
+
+check_permission() {
+  [[ "$UID" -eq '0' ]] && return
+  note "ผู้ใช้ปัจจุบันไม่ใช่ root"
+  case "$FORCE_NO_ROOT" in
+    '1') warn "FORCE_NO_ROOT=1 ดำเนินการต่อ (อาจผิดพลาด)"; ;;
+    *)   rerun_with_sudo || { error "รันด้วย sudo หรือระบุ FORCE_NO_ROOT=1"; exit 13; } ;;
+  esac
+}
+
+detect_package_manager() {
+  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
+  if has_command apt;     then apt update; PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install'; return 0; fi
+  if has_command dnf;     then PACKAGE_MANAGEMENT_INSTALL='dnf -y install'; return 0; fi
+  if has_command yum;     then PACKAGE_MANAGEMENT_INSTALL='yum -y install'; return 0; fi
+  if has_command zypper;  then PACKAGE_MANAGEMENT_INSTALL='zypper install -y --no-install-recommends'; return 0; fi
+  if has_command pacman;  then PACKAGE_MANAGEMENT_INSTALL='pacman -Syu --noconfirm'; return 0; fi
+  return 1
+}
+
+install_software() {
+  local _p="$1"
+  detect_package_manager || { error "ไม่พบตัวจัดการแพ็กเกจ ติดตั้ง '$_p' เอง"; exit 65; }
+  echo "กำลังติดตั้ง $_p ..."
+  $PACKAGE_MANAGEMENT_INSTALL "$_p" >/dev/null && ok "ติดตั้ง $_p เสร็จ" || { error "ติดตั้ง $_p ไม่สำเร็จ"; exit 65; }
+}
+
+is_user_exists() { id "$1" >/dev/null 2>&1; }
+
+check_environment() {
+  if [[ -n "$OPERATING_SYSTEM" ]]; then warn "บังคับ OS=$OPERATING_SYSTEM"
+  else [[ "x$(uname)" == "xLinux" ]] || { error "รองรับเฉพาะ Linux"; exit 95; }; OPERATING_SYSTEM=linux; fi
+
+  if [[ -n "$ARCHITECTURE" ]]; then warn "บังคับ ARCH=$ARCHITECTURE"
+  else
+    case "$(uname -m)" in
+      i386|i686)         ARCHITECTURE=386 ;;
+      amd64|x86_64)      ARCHITECTURE=amd64 ;;
+      armv5*|armv6*|armv7*) ARCHITECTURE=arm ;;
+      armv8*|aarch64)    ARCHITECTURE=arm64 ;;
+      mips*|mips64*)     ARCHITECTURE=mipsle ;;
+      s390x)             ARCHITECTURE=s390x ;;
+      loongarch64)       ARCHITECTURE=loong64 ;;
+      *) error "สถาปัตยกรรม $(uname -m) ไม่รองรับ"; exit 8 ;;
+    esac
+  fi
+
+  if [[ ! -d "/run/systemd/system" ]] && ! grep -q systemd <(ls -l /sbin/init 2>/dev/null); then
+    case "$FORCE_NO_SYSTEMD" in
+      1) warn "FORCE_NO_SYSTEMD=1 ดำเนินการต่อ" ;;
+      2) warn "FORCE_NO_SYSTEMD=2 ข้าม systemd" ;;
+      *) error "ต้องการ Linux ที่ใช้ systemd"; exit 1 ;;
+    esac
+  fi
+
+  has_command curl || install_software curl
+  has_command grep || install_software grep
+  has_command jq   || install_software jq
+}
+
+get_systemd_version() {
+  has_command systemctl || return
+  command systemctl --version 2>/dev/null | head -1 | cut -d' ' -f2
+}
+
+systemd_unit_working_directory() {
+  local v="$(get_systemd_version || true)"
+  if [[ -n "$v" && "$v" -lt "227" ]]; then echo "$HYSTERIA_HOME_DIR"; return; fi
+  echo "~"
+}
+
+get_selinux_context() {
+  local _f="$1" _r="$(ls -dZ "$_f" 2>/dev/null | head -1)"
+  case "$(echo "$_r" | wc -w)" in
+    2) echo "$_r" | cut -d' ' -f1 ;;
+    5) echo "$_r" | cut -d' ' -f4 ;;
+    *) echo "" ;;
+  esac
+}
+
+check_hysteria_user() {
+  [[ -n "$HYSTERIA_USER" ]] && return
+  if [[ -e "$SYSTEMD_SERVICES_DIR/hysteria-server.service" ]]; then
+    HYSTERIA_USER="$(grep -oP '^User=\K\w+' "$SYSTEMD_SERVICES_DIR/hysteria-server.service" 2>/dev/null || true)"
+  fi
+  : "${HYSTERIA_USER:=$1}"
+}
+
+check_hysteria_homedir() {
+  [[ -n "$HYSTERIA_HOME_DIR" ]] && return
+  if is_user_exists "$HYSTERIA_USER"; then HYSTERIA_HOME_DIR="$(eval echo ~"$HYSTERIA_USER")"
+  else HYSTERIA_HOME_DIR="$1"; fi
+}
+
+
+### ============================================================
+### 📦 เปรียบเทียบเวอร์ชัน / ดาวน์โหลด (จากต้นฉบับ เก็บเหมือนเดิม)
+### ============================================================
+vercmp_segment() {
+  local l="$1" r="$2"
+  [[ "x$l" == "x$r" ]] && { echo 0; return; }
+  [[ -z "$l" ]] && { echo -1; return; }
+  [[ -z "$r" ]] && { echo 1; return; }
+  local ln="${l//[A-Za-z]*/}" rn="${r//[A-Za-z]*/}"
+  [[ "x$ln" == "x$rn" ]] || { echo $((10#$ln - 10#$rn)); return; }
+  local ls="${l#"$ln"}" rs="${r#"$rn"}"
+  [[ "x$ls" == "x$rs" ]] && { echo 0; return; }
+  [[ -z "$ls" ]] && { echo 1; return; }
+  [[ -z "$rs" ]] && { echo -1; return; }
+  [[ "$ls" < "$rs" ]] && echo -1 || echo 1
+}
+
+vercmp() {
+  local l="${1#v}" r="${2#v}"
+  while [[ -n "$l" && -n "$r" ]]; do
+    local cl="${l/.*/}" cr="${r/.*/}" sc="$(vercmp_segment "$cl" "$cr")"
+    [[ "$sc" -ne 0 ]] && { echo "$sc"; return; }
+    l="${l#"$cl"}"; l="${l#.}"; r="${r#"$cr"}"; r="${r#.}"
+  done
+  [[ "x$l" == "x$r" ]] && echo 0 || { [[ -z "$l" ]] && echo -1 || echo 1; }
+}
+
+is_hysteria_installed() { [[ -f "$EXECUTABLE_INSTALL_PATH" || -h "$EXECUTABLE_INSTALL_PATH" ]]; }
+is_hysteria1_version() { has_prefix "$1" "v1." || has_prefix "$1" "v0."; }
+
+get_installed_version() {
+  is_hysteria_installed || return
+  if "$EXECUTABLE_INSTALL_PATH" version >/dev/null 2>&1; then
+    "$EXECUTABLE_INSTALL_PATH" version | grep -oP '^Version\s+\Kv[\d.]+'
+  elif "$EXECUTABLE_INSTALL_PATH" -v >/dev/null 2>&1; then
+    "$EXECUTABLE_INSTALL_PATH" -v | awk '{print $3}'
+  fi
+}
+
+get_latest_version() {
+  [[ -n "$VERSION" ]] && { echo "$VERSION"; return; }
+  local tmp="$(mktemp)"
+  if ! curl -sS "$HY2_API_BASE_URL/update?cver=thai&plat=${OPERATING_SYSTEM}&arch=${ARCHITECTURE}&chan=release&side=server" -o "$tmp"; then
+    error "ไม่สามารถเรียก Hysteria API ได้"; exit 11
+  fi
+  local lv="$(grep -oP '"lver"\s*:\s*"\Kv[^"]+' "$tmp" | head -1)"
+  rm -f "$tmp"
+  [[ -n "$lv" ]] && echo "$lv" || { error "ไม่พบเวอร์ชันล่าสุด"; exit 11; }
+}
+
+download_hysteria() {
+  local ver="$1" out="$2"
+  local url="$REPO_URL/releases/download/app/$ver/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
+  echo "🔽 ดาวน์โหลด $url"
+  curl -R -H 'Cache-Control: no-cache' "$url" -o "$out" || { error "ดาวน์โหลดล้มเหลว"; return 11; }
+  chmod +x "$out"
+}
+
+check_update() {
+  echo -n "   เวอร์ชันที่ติดตั้ง : "
+  local iv="$(get_installed_version)"
+  [[ -n "$iv" ]] && echo "$iv" || echo "(ยังไม่ติดตั้ง)"
+  echo -n "   เวอร์ชันล่าสุด     : "
+  local lv="$(get_latest_version)"
+  echo "$lv"; VERSION="$lv"
+  local c="$(vercmp "$iv" "$lv")"
+  [[ "$c" -lt 0 ]] && return 0 || return 1
+}
+
+
+### ============================================================
+### 👤 ระบบฐานข้อมูลผู้ใช้ (users.db) ใหม่
+###    รูปแบบ: user|pass|IP1,IP2|YYYY-MM-DD|note
+### ============================================================
+init_user_db() {
+  mkdir -p "$CONFIG_DIR"
+  [[ -f "$USER_DB" ]] || : > "$USER_DB"
+  chown -R "$HYSTERIA_USER":"$HYSTERIA_USER" "$CONFIG_DIR" 2>/dev/null || true
+  chmod 600 "$USER_DB" 2>/dev/null || true
+}
+user_exists()     { [[ -n "$1" ]] && grep -q "^${1}|" "$USER_DB" 2>/dev/null; }
+add_user_db()     { echo "$1|$2|$3|$4|$5" >> "$USER_DB"; }
+del_user_db()     { sed -i "/^${1}|/d" "$USER_DB"; }
+count_users()     { wc -l < "$USER_DB" | tr -d ' '; }
+get_user_field()  { awk -F'|' -v u="$1" -v i="$2" '$1==u {print $i; exit}' "$USER_DB"; }
+set_user_field()  {
+  awk -F'|' -v OFS='|' -v u="$1" -v i="$2" -v v="$3" '$1==u{$i=v} {print}' "$USER_DB" > "${USER_DB}.tmp"
+  mv "${USER_DB}.tmp" "$USER_DB"
+}
+
+
+### ============================================================
+### 🔑 Auth Helper (เช็ค รหัสผ่าน ✅ IP ✅ หมดอายุ ✅)
+### ============================================================
+build_auth_helper() {
+  cat > "$AUTH_HELPER" <<'AUTH_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+DB="/etc/hysteria/users.db"
+LOG="/etc/hysteria/auth.log"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
+
+[[ -z "${AUTH:-}" ]] && { log "AUTH ว่าง"; exit 1; }
+USER="${AUTH%%:*}"; PASS="${AUTH#*:}"
+[[ -z "$USER" || -z "$PASS" ]] && { log "AUTH ไม่ถูกต้อง"; exit 1; }
+
+LINE="$(grep "^${USER}|" "$DB" 2>/dev/null || true)"
+[[ -z "$LINE" ]] && { log "❌ ไม่พบ user=[$USER]"; exit 1; }
+IFS='|' read -r DB_U DB_P DB_IPS DB_EXP DB_NOTE <<< "$LINE"
+
+# 1) รหัสผ่าน
+[[ "$PASS" != "$DB_P" ]] && { log "❌ [$USER] รหัสผิด IP=${SRC_ADDR:-?}"; exit 1; }
+
+# 2) หมดอายุ
+if [[ -n "$DB_EXP" && "$DB_EXP" != "0000-00-00" ]]; then
+  [[ "$(date +%Y-%m-%d)" > "$DB_EXP" ]] && { log "⏰ [$USER] หมดอายุ $DB_EXP"; exit 1; }
+fi
+
+# 3) IP Whitelist
+if [[ -n "$DB_IPS" ]]; then
+  SIP="${SRC_ADDR%:*}"; SIP="${SIP#[}"; SIP="${SIP%]}"
+  OK=0
+  IFS=',' read -ra IPL <<< "$DB_IPS"
+  for IP in "${IPL[@]}"; do
+    [[ -z "$IP" ]] && continue
+    if [[ "$IP" == */* ]] && command -v grepcidr >/dev/null; then
+      echo "$SIP" | grepcidr "$IP" >/dev/null 2>&1 && { OK=1; break; }
+    else
+      [[ "$SIP" == "$IP" ]] && { OK=1; break; }
     fi
+  done
+  [[ "$OK" -ne 1 ]] && { log "🚫 [$USER] IP=$SIP ไม่อยู่ใน [$DB_IPS]"; exit 1; }
+fi
+
+log "✅ [$USER] เข้าสู่ระบบ IP=${SRC_ADDR:-?} exp=$DB_EXP"
+echo "$USER"; exit 0
+AUTH_EOF
+  chmod +x "$AUTH_HELPER"
+  chown "$HYSTERIA_USER":"$HYSTERIA_USER" "$AUTH_HELPER" 2>/dev/null || true
 }
 
-T_BOLD=$(tput bold)
-T_GREEN=$(tput setaf 2)
-T_YELLOW=$(tput setaf 3)
-T_RED=$(tput setaf 1)
-T_RESET=$(tput sgr0)
 
-script_header() {
-    clear
-    echo ""
-    echo ".-.   .-..---.  ,-.  _______     "
-    echo " \ \ / // .-. ) | | |__   __|    "
-    echo "  \ V / | | |(_)| |   )| |       "
-    echo "   ) /  | | | | | |  (_) |       "
-    echo "  (_)   \ \`-' / | \`--. | |       "
-    echo "         )---'  |( __.'\`-'       "
-    echo "        (_)     (_)              "
-    echo "  Telegram: @voltsshx //"
-    echo "  ..SSHX.. (c)2021 </> 2024 //"
-    echo ""
-
-    echo -e "\e[1m\e[34m****************************************************"
-    echo -e "  การติดตั้งและตั้งค่า \e[1;36mHysteria Protocol"
-    echo -e "              (เวอร์ชัน 1.3.5) - โดย: @voltsshx"
-    echo -e "\e[1m\e[34m****************************************************\e[0m"
-    echo ""
+### ============================================================
+### ⚙️ สร้าง config.yaml / ACL / systemd / cron
+### ============================================================
+install_content() {
+  local _f="$1" _c="$2" _d="$3" _o="$4" _t="$(mktemp)"
+  echo -ne "ติดตั้ง $_d ... "
+  echo "$_c" > "$_t"
+  if [[ -z "$_o" && -e "$_d" ]]; then echo "มีอยู่แล้ว"
+  elif install "$_f" "$_t" "$_d"; then echo "เสร็จ"; fi
+  rm -f "$_t"
 }
 
-update_packages() {
-    clear
-    echo ""
-    echo ".-.   .-..---.  ,-.  _______     "
-    echo " \ \ / // .-. ) | | |__   __|    "
-    echo "  \ V / | | |(_)| |   )| |       "
-    echo "   ) /  | | | | | |  (_) |       "
-    echo "  (_)   \ \`-' / | \`--. | |       "
-    echo "         )---'  |( __.'\`-'       "
-    echo "        (_)     (_)              "
-    echo "  Telegram: @voltsshx //"
-    echo "  ..SSHX.. (c)2021 </> 2024 //"
-    echo ""
-
-    echo -e "\033[1;32m[\033[1;32mสำเร็จ ✅\033[1;32m] \033[1;37m ⇢  \033[1;33mกำลังเตรียมไฟล์ที่จำเป็น...\033[0m"
-    echo -e "\033[1;32m      ♻️ \033[1;37m      \033[1;33mกรุณารอสักครู่...\033[0m"
-    echo ""
-
-    sudo apt-get update && sudo apt-get upgrade -y
-
-    local dependencies=("curl" "bc" "grep" "wget" "nano" "net-tools" "figlet" "jq" "python3")
-
-    for dependency in "${dependencies[@]}"; do
-        if ! command -v "$dependency" &>/dev/null; then
-            echo "${T_YELLOW}กำลังติดตั้ง $dependency...${T_RESET}"
-            apt update && apt install -y "$dependency" >/dev/null 2>&1
-        fi
-    done
-
-    sudo apt-get install wget nano net-tools figlet lolcat -y
-
-    export PATH="/usr/games:$PATH"
-
-    if [ ! -e /usr/local/bin/lolcat ]; then
-        sudo ln -s /usr/games/lolcat /usr/local/bin/lolcat
-    fi
-
-    apt install sudo -y > /dev/null 2>&1
-
-    DEBIAN_FRONTEND=noninteractive apt-get -qq install -yqq \
-        --no-install-recommends ca-certificates > /dev/null 2>&1
-
-    clear
-    echo ""
-
-    echo -e "\033[1;32m[\033[1;32mสำเร็จ ✅\033[1;32m] \033[1;37m ⇢  \033[1;33mเตรียมไฟล์ที่จำเป็น...\033[0m"
-    echo -e "\033[1;32m      ♻️ \033[1;37m      \033[1;33mกรุณารอสักครู่...\033[0m"
-    echo ""
-}
-
-banner() {
-    sed -i '/figlet -k Voltssh-X | lolcat/,/echo -e ""/d' ~/.bashrc
-    sed -i '/figlet -k Hysteria | lolcat/,/echo -e ""/d' ~/.bashrc
-
-    echo 'clear' >>~/.bashrc
-    echo 'echo ""' >>~/.bashrc
-    echo 'figlet -k Voltssh-X | lolcat' >>~/.bashrc
-    echo 'figlet -k Hysteria | lolcat' >>~/.bashrc
-
-    echo 'echo -e "\t\e\033[94m⚙︎ Voltssh-X Hysteria โดย @voltsshx ⚙︎\033[0m"' >>~/.bashrc
-    echo 'echo -e "\t\e\033[94mTelegram: @voltsshx // \033[0m"' >>~/.bashrc
-    echo 'echo -e "\t\e\033[94m..SSHX.. (c)2021 </> 2024 // \033[0m"' >>~/.bashrc
-    echo 'echo "" ' >>~/.bashrc
-
-    echo 'echo -e "\t\033[92mTelegram   : @voltsshx | LS Tunnels" ' >>~/.bashrc
-    echo 'echo -e "\t\e[1;33mPowered by : AIB Tech Pvt."' >>~/.bashrc
-    echo 'echo ""' >>~/.bashrc
-
-    echo 'DATE=$(date +"%d-%m-%y")' >>~/.bashrc
-    echo 'TIME=$(date +"%T")' >>~/.bashrc
-
-    echo 'echo -e "\t\e[1;33mชื่อเซิร์ฟเวอร์ : $HOSTNAME"' >>~/.bashrc
-    echo 'echo -e "\t\e[1;33mเวลาที่เซิร์ฟเวอร์ทำงาน : $(uptime -p)"' >>~/.bashrc
-    echo 'echo -e "\t\e[1;33mวันที่เซิร์ฟเวอร์ : $DATE"' >>~/.bashrc
-    echo 'echo -e "\t\e[1;33mเวลาของเซิร์ฟเวอร์ : $TIME"' >>~/.bashrc
-    echo 'echo "" ' >>~/.bashrc
-
-    echo 'echo -e "\t\e\033[94mอีเมลติดต่อ: iyke.earth@gmail.com \033[0m"' >>~/.bashrc
-    echo 'echo "" ' >>~/.bashrc
-
-    echo 'echo -e "\t\e\033[92mคำสั่งเมนู: volt \033[0m"' >>~/.bashrc
-    echo 'echo -e ""' >>~/.bashrc
-    echo 'echo -e ""' >>~/.bashrc
-
-    rm -f /root/install.sh
-    cat /dev/null >~/.bash_history
-    history -c
-
-    find / -type f -name "hys.json" -delete >/dev/null 2>&1
-    find / -type f -name "install.sh" -delete >/dev/null 2>&1
-}
-
-verification() {
-    clear
-
-    fetch_valid_keys() {
-        keys=$(curl -s \
-            -H "Cache-Control: no-cache" \
-            -H "Pragma: no-cache" \
-            "https://raw.githubusercontent.com/benzvpn/Edit-UDP-Hysteria/refs/heads/main/key.json")
-
-        echo "$keys"
-    }
-
-    verify_key() {
-        local key_to_verify="$1"
-        local valid_keys="$2"
-
-        if [[ $valid_keys == *"$key_to_verify"* ]]; then
-            return 0
-        else
-            return 1
-        fi
-    }
-
-    valid_keys=$(fetch_valid_keys)
-
-    echo ""
-
-    figlet -k Voltssh-X | awk '{gsub(/./,"\033[3"int(rand()*5+1)"m&\033[0m")}1' &&
-    figlet -k Hysteria | awk '{gsub(/./,"\033[3"int(rand()*5+1)"m&\033[0m")}1'
-
-    echo "───────────────────────────────────────────────────────────────────────•"
-    echo ""
-    echo ""
-
-    echo -e " 〄 \033[1;37m ⌯  \033[1;33mคุณต้องมี Key ที่ซื้อมาเพื่อดำเนินการติดตั้ง\033[0m"
-    echo -e " 〄 \033[1;37m ⌯  \033[1;33mหากยังไม่มี กรุณาติดต่อ [v3r!f.y.Key 𝕏]\033[0m"
-    echo -e " 〄 \033[1;37m ⌯ ⇢ \033[1;33mhttps://t.me/voltverifybot\033[0m"
-    echo -e " 〄 \033[1;37m ⌯  \033[1;33mสามารถติดต่อ @voltsshx ผ่าน Telegram ได้เช่นกัน\033[0m"
-
-    echo ""
-    echo "───────────────────────────────────────────────────────────────────────•"
-
-    read -p " ⇢ กรุณากรอก Installation Key: " user_key
-    user_key=$(echo "$user_key" | tr -d '[:space:]')
-
-    if [[ ${#user_key} -ne 10 ]]; then
-        echo "${T_RED} ⇢ การตรวจสอบไม่สำเร็จ ยกเลิกการติดตั้ง${T_RESET}"
-
-        find / -type f -name "hys.json" -delete >/dev/null 2>&1
-        rm -f /root/hys.json >/dev/null 2>&1
-        rm -f hys.json >/dev/null 2>&1
-
-        echo ""
-        exit 1
-    fi
-
-    if verify_key "$user_key" "$valid_keys"; then
-
-        sleep 2
-
-        echo "${T_GREEN} ⇢ ตรวจสอบ Key สำเร็จ${T_RESET}"
-        echo "${T_GREEN} ⇢ กำลังดำเนินการติดตั้ง...${T_RESET}"
-
-        echo ""
-        echo ""
-        echo -e "\033[1;32m ♻️ กรุณารอสักครู่...\033[0m"
-
-        find / -type f -name "hys.json" -delete >/dev/null 2>&1
-        rm -f /root/hys.json >/dev/null 2>&1
-        rm -f hys.json >/dev/null 2>&1
-
-        sleep 1
-        clear
-        clear
-
-        validate_length() {
-            local input_string="$1"
-            local min_length="$2"
-
-            if [ ${#input_string} -lt $min_length ]; then
-                echo "ข้อมูลต้องมีความยาวอย่างน้อย $min_length ตัวอักษร"
-                return 1
-            fi
-        }
-
-        figlet -k Voltssh-X | awk '{gsub(/./,"\033[3"int(rand()*5+1)"m&\033[0m")}1' &&
-        figlet -k Hysteria | awk '{gsub(/./,"\033[3"int(rand()*5+1)"m&\033[0m")}1'
-
-        echo "───────────────────────────────────────────────────────────────────────•"
-
-        echo -e "   การตั้งค่าเซิร์ฟเวอร์ Hysteria"
-        echo -e "*******************************************\e[0m"
-        echo ""
-
-        HYST_SERVER_IP=$(curl -s https://api.ipify.org)
-
-        echo -e "\nIP โฮสต์/เซิร์ฟเวอร์ 👉 $HYST_SERVER_IP"
-        echo "-------------------------------------------"
-
-        echo -e "\nกรุณากรอกโดเมนของคุณ: 👇"
-        echo -e "(สามารถรับโดเมนฟรีได้จาก 'https://duckdns.org')"
-
-        read -p "" DOMAIN
-
-        echo "-------------------------------------------"
-
-        while true; do
-            echo -e "\nกรุณากรอก Obfuscation (OBFS): 👇"
-            echo -e "(ต้องมีความยาวอย่างน้อย 10 ตัวอักษร)"
-
-            read -p "" OBFS
-
-            if validate_length "$OBFS" 10; then
-                break
-            fi
-        done
-
-        echo "-------------------------------------------"
-
-        while true; do
-            echo -e "\nกรุณากรอก Authentication (AUTH): 👇"
-            echo -e "(ต้องมีความยาวอย่างน้อย 10 ตัวอักษร)"
-
-            read -p "" PASSWORD
-
-            if validate_length "$PASSWORD" 10; then
-                break
-            fi
-        done
-
-        echo ""
-
-        mkdir -p /etc/volt
-
-PROTOCOL="udp"
-
-# Hysteria Server listen port
-UDP_PORT="36712"
-
-# Port Hopping range
-UDP_PORT_HP="10000-65000"
-HPStart="10000"
-HPEnd="65000"
-
-# QUIC Receive Window
-UDP_QUIC_WINDOW="196608"
-
-# URI remark
-remarks="VoltxHysteriaConfig"
-
-# Self-signed certificate
-sec="1"
-
-        url="hysteria://${DOMAIN}:${UDP_PORT_HP}?protocol=${PROTOCOL}&auth=${PASSWORD}&obfsParam=${OBFS}&peer=${DOMAIN}&insecure=${sec}&upmbps=100&downmbps=100&alpn=h3#${remarks}"
-        url="hysteria2://${PASSWORD}@${DOMAIN}:${UDP_PORT_HP}/?obfs=salamander&obfs-password=${OBFS}&insecure=1&sni=${DOMAIN}#${remarks}"
-
-        supportedApps="แอปที่รองรับ: AIO Tunnel, AIO Injector, Http Injector, NekoBox"
-
-        echo "$DOMAIN" >/etc/volt/DOMAIN
-        echo "$PROTOCOL" >/etc/volt/PROTOCOL
-        echo "$UDP_PORT" >/etc/volt/UDP_PORT
-        echo "$UDP_PORT_HP" >/etc/volt/UDP_PORT_HP
-        echo "$OBFS" >/etc/volt/OBFS
-        install_volt_multi_user
-
-        export DOMAIN
-        export PROTOCOL
-        export UDP_PORT
-        export UDP_PORT_HP
-        export OBFS
-        export PASSWORD
-
-        SCRIPT_NAME="$(basename "$0")"
-        SCRIPT_ARGS=("$@")
-
-        EXECUTABLE_INSTALL_PATH="/usr/local/bin/hysteria"
-        SYSTEMD_SERVICES_DIR="/etc/systemd/system"
-        CONFIG_DIR="/etc/hysteria"
-
-        REPO_URL="https://github.com/apernet/hysteria"
-        API_BASE_URL="https://api.github.com/repos/apernet/hysteria"
-
-        CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
-
-        PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
-        OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
-        ARCHITECTURE="${ARCHITECTURE:-}"
-        HYSTERIA_USER="${HYSTERIA_USER:-}"
-        HYSTERIA_HOME_DIR="${HYSTERIA_HOME_DIR:-}"
-
-        OPERATION=
-        VERSION=
-        FORCE=
-        LOCAL_FILE=
-
-        has_command() {
-            local _command=$1
-            type -P "$_command" >/dev/null 2>&1
-        }
-
-        curl() {
-            command curl "${CURL_FLAGS[@]}" "$@"
-        }
-
-        mktemp() {
-            command mktemp "$@" "hyservinst.XXXXXXXXXX"
-        }
-
-        tput() {
-            if has_command tput; then
-                command tput "$@"
-            fi
-        }
-
-        tred() {
-            tput setaf 1
-        }
-
-        tgreen() {
-            tput setaf 2
-        }
-
-        tyellow() {
-            tput setaf 3
-        }
-
-        tblue() {
-            tput setaf 4
-        }
-
-        taoi() {
-            tput setaf 6
-        }
-
-        tbold() {
-            tput bold
-        }
-
-        treset() {
-            tput sgr0
-        }
-
-        note() {
-            local _msg="$1"
-            echo -e "$SCRIPT_NAME: $(tbold)หมายเหตุ: $_msg$(treset)"
-        }
-
-        warning() {
-            local _msg="$1"
-            echo -e "$SCRIPT_NAME: $(tyellow)คำเตือน: $_msg$(treset)"
-        }
-
-        error() {
-            local _msg="$1"
-            echo -e "$SCRIPT_NAME: $(tred)ข้อผิดพลาด: $_msg$(treset)"
-        }
-
-        has_prefix() {
-            local _s="$1"
-            local _prefix="$2"
-
-            if [[ -z "$_prefix" ]]; then
-                return 0
-            fi
-
-            if [[ -z "$_s" ]]; then
-                return 1
-            fi
-
-            [[ "x$_s" != "x${_s#"$_prefix"}" ]]
-        }
-
-        systemctl() {
-            if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]] || ! has_command systemctl; then
-                return
-            fi
-
-            command systemctl "$@"
-        }
-
-        show_argument_error_and_exit() {
-            local _error_msg="$1"
-
-            error "$_error_msg"
-            echo "ลองใช้ \"$0 --help\" เพื่อดูวิธีใช้งาน" >&2
-            exit 22
-        }
-
-        install_content() {
-            local _install_flags="$1"
-            local _content="$2"
-            local _destination="$3"
-            local _tmpfile="$(mktemp)"
-
-            echo -ne "กำลังติดตั้ง $_destination ... "
-
-            echo "$_content" >"$_tmpfile"
-
-            if install "$_install_flags" "$_tmpfile" "$_destination"; then
-                echo -e "สำเร็จ"
-            fi
-
-            rm -f "$_tmpfile"
-        }
-
-        remove_file() {
-            local _target="$1"
-
-            echo -ne "กำลังลบ $_target ... "
-
-            if rm "$_target"; then
-                echo -e "สำเร็จ"
-            fi
-        }
-
-        exec_sudo() {
-            local _saved_ifs="$IFS"
-            IFS=$'\n'
-
-            local _preserved_env=(
-                $(env | grep "^PACKAGE_MANAGEMENT_INSTALL=" || true)
-                $(env | grep "^OPERATING_SYSTEM=" || true)
-                $(env | grep "^ARCHITECTURE=" || true)
-                $(env | grep "^HYSTERIA_\w*=" || true)
-                $(env | grep "^FORCE_\w*=" || true)
-            )
-
-            IFS="$_saved_ifs"
-
-            exec sudo env \
-                "${_preserved_env[@]}" \
-                "$@"
-        }
-
-        detect_package_manager() {
-            if [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]]; then
-                return 0
-            fi
-
-            if has_command apt; then
-                PACKAGE_MANAGEMENT_INSTALL='apt update; apt -y install'
-                return 0
-            fi
-
-            if has_command dnf; then
-                PACKAGE_MANAGEMENT_INSTALL='dnf check-update; dnf -y install'
-                return 0
-            fi
-
-            if has_command yum; then
-                PACKAGE_MANAGEMENT_INSTALL='yum update; yum -y install'
-                return 0
-            fi
-
-            if has_command zypper; then
-                PACKAGE_MANAGEMENT_INSTALL='zypper update; zypper install -y --no-recommends'
-                return 0
-            fi
-
-            if has_command pacman; then
-                PACKAGE_MANAGEMENT_INSTALL='pacman -Syu; pacman -Syu --noconfirm'
-                return 0
-            fi
-
-            return 1
-        }
-
-        install_software() {
-            local _package_name="$1"
-
-            if ! detect_package_manager; then
-                error "ไม่พบ Package Manager ที่รองรับ กรุณาติดตั้งแพ็กเกจต่อไปนี้ด้วยตนเอง:"
-                echo
-                echo -e "\t* $_package_name"
-                echo
-                exit 65
-            fi
-
-            echo "กำลังติดตั้ง dependency ที่ขาดหายไป '$_package_name' ด้วย '$PACKAGE_MANAGEMENT_INSTALL' ... "
-
-            if $PACKAGE_MANAGEMENT_INSTALL "$_package_name"; then
-                echo "สำเร็จ"
-            else
-                error "ไม่สามารถติดตั้ง '$_package_name' ด้วย Package Manager ที่ตรวจพบ กรุณาติดตั้งด้วยตนเอง"
-                exit 65
-            fi
-        }
-
-        is_user_exists() {
-            local _user="$1"
-            id "$_user" >/dev/null 2>&1
-        }
-
-        check_permission() {
-            if [[ "$UID" -eq '0' ]]; then
-                return
-            fi
-
-            note "ผู้ใช้ที่กำลังเรียกใช้สคริปต์นี้ไม่ใช่ root"
-
-            case "$FORCE_NO_ROOT" in
-                '1')
-                    warning "กำหนด FORCE_NO_ROOT=1 ระบบจะทำงานโดยไม่ใช้ root และอาจพบข้อผิดพลาดด้านสิทธิ์"
-                    ;;
-                *)
-                    if has_command sudo; then
-                        note "กำลังเรียกใช้สคริปต์ใหม่ด้วย sudo หากต้องการบังคับใช้ผู้ใช้ปัจจุบัน ให้กำหนด FORCE_NO_ROOT=1"
-
-                        exec_sudo "$0" "${SCRIPT_ARGS[@]}"
-                    else
-                        error "กรุณารันสคริปต์ด้วย root หรือกำหนด FORCE_NO_ROOT=1 เพื่อบังคับใช้ผู้ใช้ปัจจุบัน"
-                        exit 13
-                    fi
-                    ;;
-            esac
-        }
-
-        check_environment_operating_system() {
-            if [[ -n "$OPERATING_SYSTEM" ]]; then
-                warning "กำหนด OPERATING_SYSTEM=$OPERATING_SYSTEM ระบบจะไม่ตรวจสอบระบบปฏิบัติการ"
-                return
-            fi
-
-            if [[ "x$(uname)" == "xLinux" ]]; then
-                OPERATING_SYSTEM=linux
-                return
-            fi
-
-            error "สคริปต์นี้รองรับเฉพาะ Linux"
-            note "กำหนด OPERATING_SYSTEM=[linux|darwin|freebsd|windows] เพื่อข้ามการตรวจสอบนี้"
-
-            exit 95
-        }
-
-        check_environment_architecture() {
-            if [[ -n "$ARCHITECTURE" ]]; then
-                warning "กำหนด ARCHITECTURE=$ARCHITECTURE ระบบจะไม่ตรวจสอบสถาปัตยกรรม"
-                return
-            fi
-
-            case "$(uname -m)" in
-                'i386' | 'i686')
-                    ARCHITECTURE='386'
-                    ;;
-                'amd64' | 'x86_64')
-                    ARCHITECTURE='amd64'
-                    ;;
-                'armv5tel' | 'armv6l' | 'armv7' | 'armv7l')
-                    ARCHITECTURE='arm'
-                    ;;
-                'armv8' | 'aarch64')
-                    ARCHITECTURE='arm64'
-                    ;;
-                'mips' | 'mipsle' | 'mips64' | 'mips64le')
-                    ARCHITECTURE='mipsle'
-                    ;;
-                's390x')
-                    ARCHITECTURE='s390x'
-                    ;;
-                *)
-                    error "ไม่รองรับสถาปัตยกรรม '$(uname -a)'"
-                    note "กำหนด ARCHITECTURE=<architecture> เพื่อข้ามการตรวจสอบนี้"
-                    exit 8
-                    ;;
-            esac
-        }
-
-        check_environment_systemd() {
-            if [[ -d "/run/systemd/system" ]] || grep -q systemd <(ls -l /sbin/init); then
-                return
-            fi
-
-            case "$FORCE_NO_SYSTEMD" in
-                '1')
-                    warning "กำหนด FORCE_NO_SYSTEMD=1 ระบบจะดำเนินการต่อแม้ไม่พบ systemd"
-                    ;;
-                '2')
-                    warning "กำหนด FORCE_NO_SYSTEMD=2 ระบบจะดำเนินการต่อ แต่จะไม่เรียกใช้คำสั่งที่เกี่ยวข้องกับ systemd"
-                    ;;
-                *)
-                    error "สคริปต์นี้รองรับเฉพาะ Linux distribution ที่ใช้ systemd"
-                    note "กำหนด FORCE_NO_SYSTEMD=1 เพื่อข้ามการตรวจสอบ"
-                    note "กำหนด FORCE_NO_SYSTEMD=2 เพื่อข้ามการตรวจสอบและปิดคำสั่ง systemd ทั้งหมด"
-                    ;;
-            esac
-        }
-
-        check_environment_curl() {
-            if has_command curl; then
-                return
-            fi
-
-            apt update
-            apt -y install curl
-        }
-
-        check_environment_grep() {
-            if has_command grep; then
-                return
-            fi
-
-            apt update
-            apt -y install grep
-        }
-
-        check_environment() {
-            check_environment_operating_system
-            check_environment_architecture
-            check_environment_systemd
-            check_environment_curl
-            check_environment_grep
-        }
-
-        vercmp_segment() {
-            local _lhs="$1"
-            local _rhs="$2"
-
-            if [[ "x$_lhs" == "x$_rhs" ]]; then
-                echo 0
-                return
-            fi
-
-            if [[ -z "$_lhs" ]]; then
-                echo -1
-                return
-            fi
-
-            if [[ -z "$_rhs" ]]; then
-                echo 1
-                return
-            fi
-
-            local _lhs_num="${_lhs//[A-Za-z]*/}"
-            local _rhs_num="${_rhs//[A-Za-z]*/}"
-
-            if [[ "x$_lhs_num" == "x$_rhs_num" ]]; then
-                echo 0
-                return
-            fi
-
-            if [[ -z "$_lhs_num" ]]; then
-                echo -1
-                return
-            fi
-
-            if [[ -z "$_rhs_num" ]]; then
-                echo 1
-                return
-            fi
-
-            local _numcmp=$(($_lhs_num - $_rhs_num))
-
-            if [[ "$_numcmp" -ne 0 ]]; then
-                echo "$_numcmp"
-                return
-            fi
-
-            local _lhs_suffix="${_lhs#"$_lhs_num"}"
-            local _rhs_suffix="${_rhs#"$_rhs_num"}"
-
-            if [[ "x$_lhs_suffix" == "x$_rhs_suffix" ]]; then
-                echo 0
-                return
-            fi
-
-            if [[ -z "$_lhs_suffix" ]]; then
-                echo 1
-                return
-            fi
-
-            if [[ -z "$_rhs_suffix" ]]; then
-                echo -1
-                return
-            fi
-
-            if [[ "$_lhs_suffix" < "$_rhs_suffix" ]]; then
-                echo -1
-                return
-            fi
-
-            echo 1
-        }
-
-        vercmp() {
-            local _lhs=${1#v}
-            local _rhs=${2#v}
-
-            while [[ -n "$_lhs" && -n "$_rhs" ]]; do
-                local _clhs="${_lhs/.*/}"
-                local _crhs="${_rhs/.*/}"
-
-                local _segcmp="$(vercmp_segment "$_clhs" "$_crhs")"
-
-                if [[ "$_segcmp" -ne 0 ]]; then
-                    echo "$_segcmp"
-                    return
-                fi
-
-                _lhs="${_lhs#"$_clhs"}"
-                _lhs="${_lhs#.}"
-
-                _rhs="${_rhs#"$_crhs"}"
-                _rhs="${_rhs#.}"
-            done
-
-            if [[ "x$_lhs" == "x$_rhs" ]]; then
-                echo 0
-                return
-            fi
-
-            if [[ -z "$_lhs" ]]; then
-                echo -1
-                return
-            fi
-
-            if [[ -z "$_rhs" ]]; then
-                echo 1
-                return
-            fi
-
-            return
-        }
-
-        check_hysteria_user() {
-            local _default_hysteria_user="$1"
-
-            if [[ -n "$HYSTERIA_USER" ]]; then
-                return
-            fi
-
-            if [[ ! -e "$SYSTEMD_SERVICES_DIR/hysteria.service" ]]; then
-                HYSTERIA_USER="$_default_hysteria_user"
-                return
-            fi
-
-            HYSTERIA_USER="$(grep -o '^User=\w*' "$SYSTEMD_SERVICES_DIR/hysteria.service" |
-                tail -1 | cut -d '=' -f 2 || true)"
-
-            if [[ -z "$HYSTERIA_USER" ]]; then
-                HYSTERIA_USER="$_default_hysteria_user"
-            fi
-        }
-
-        check_hysteria_homedir() {
-            local _default_hysteria_homedir="$1"
-
-            if [[ -n "$HYSTERIA_HOME_DIR" ]]; then
-                return
-            fi
-
-            if ! is_user_exists "$HYSTERIA_USER"; then
-                HYSTERIA_HOME_DIR="$_default_hysteria_homedir"
-                return
-            fi
-
-            HYSTERIA_HOME_DIR="$(eval echo ~"$HYSTERIA_USER")"
-        }
-
-        tpl_hysteria_server_service_base() {
-    local _config_name="$1"
-
-    cat <<EOF
+tpl_server_svc() {
+  cat <<EOF
 [Unit]
-Description=Voltssh-X Hysteria 2 Service
-After=network-online.target
-Wants=network-online.target
-
+Description=Hysteria 2 Server (ภาษาไทย)
+After=network.target nss-lookup.target
 [Service]
 Type=simple
-User=root
-Group=root
-WorkingDirectory=/etc/hysteria
-ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.json
+ExecStart=$EXECUTABLE_INSTALL_PATH server --config $CONFIG_FILE
+WorkingDirectory=$(systemd_unit_working_directory)
+User=$HYSTERIA_USER
+Group=$HYSTERIA_USER
+Environment=HYSTERIA_LOG_LEVEL=info
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
 Restart=on-failure
-RestartSec=3
-
+RestartSec=5s
 [Install]
 WantedBy=multi-user.target
 EOF
 }
 
-        tpl_hysteria_server_service() {
-            tpl_hysteria_server_service_base 'config'
-        }
-
-        tpl_hysteria_server_x_service() {
-            tpl_hysteria_server_service_base '%i'
-        }
-
-        # ============================================================
-# VOLTSSH-X HYSTERIA 2
-# MULTI USER / MULTI PASSWORD SYSTEM
-# ============================================================
-
-VOLT_DIR="/etc/volt"
-HY_CONFIG_DIR="/etc/hysteria"
-VOLT_CONFIG="$VOLT_DIR/config.json"
-VOLT_AUTH="$VOLT_DIR/auth.py"
-VOLT_CFGUPT="$VOLT_DIR/cfgupt.py"
-HY_CONFIG="$HY_CONFIG_DIR/config.json"
-
-
-# ------------------------------------------------------------
-# ตรวจ dependency
-# ------------------------------------------------------------
-
-install_volt_python_dependencies() {
-
-    mkdir -p "$VOLT_DIR"
-    mkdir -p "$HY_CONFIG_DIR"
-
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo "กำลังติดตั้ง Python3..."
-        apt-get update
-        apt-get install -y python3
-    fi
-
-    if ! command -v openssl >/dev/null 2>&1; then
-        echo "กำลังติดตั้ง OpenSSL..."
-        apt-get update
-        apt-get install -y openssl
-    fi
-}
-
-
-# ------------------------------------------------------------
-# สร้าง auth.py
-# ------------------------------------------------------------
-
-install_volt_auth_py() {
-
-cat <<'PY' > "$VOLT_AUTH"
-#!/usr/bin/env python3
-
-import json
-import os
-import re
-import secrets
-import string
-import tempfile
-from urllib.parse import quote
-
-CONFIG_FILE = "/etc/volt/config.json"
-
-
-DEFAULT_CONFIG = {
-    "version": 2,
-
-    "server": {
-        "domain": "",
-        "ip": "",
-        "port": 36712,
-        "port_hopping": "10000-65000",
-        "protocol": "udp",
-        "obfs": "",
-        "bandwidth_up": "100 mbps",
-        "bandwidth_down": "100 mbps"
-    },
-
-    "users": {}
-}
-
-
-def ensure_directory():
-    directory = os.path.dirname(CONFIG_FILE)
-
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-
-
-def atomic_write_json(path, data):
-
-    directory = os.path.dirname(path) or "."
-
-    os.makedirs(directory, exist_ok=True)
-
-    fd, tmp = tempfile.mkstemp(
-        prefix=".config.",
-        suffix=".tmp",
-        dir=directory
-    )
-
-    try:
-
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(
-                data,
-                f,
-                indent=2,
-                ensure_ascii=False
-            )
-            f.write("\n")
-
-        os.chmod(tmp, 0o600)
-
-        os.replace(tmp, path)
-
-    except Exception:
-
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-
-        raise
-
-
-def normalize_config(data):
-
-    if not isinstance(data, dict):
-        data = {}
-
-    if not isinstance(data.get("server"), dict):
-        data["server"] = {}
-
-    if not isinstance(data.get("users"), dict):
-        data["users"] = {}
-
-    data.setdefault("version", 2)
-
-    server_defaults = DEFAULT_CONFIG["server"]
-
-    for key, value in server_defaults.items():
-        data["server"].setdefault(key, value)
-
-    return data
-
-
-def load_config():
-
-    ensure_directory()
-
-    if not os.path.exists(CONFIG_FILE):
-
-        data = json.loads(
-            json.dumps(DEFAULT_CONFIG)
-        )
-
-        save_config(data)
-
-        return data
-
-    try:
-
-        with open(
-            CONFIG_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            data = json.load(f)
-
-    except (OSError, json.JSONDecodeError):
-
-        raise RuntimeError(
-            "ไม่สามารถอ่าน /etc/volt/config.json ได้"
-        )
-
-    return normalize_config(data)
-
-
-def save_config(data):
-
-    data = normalize_config(data)
-
-    atomic_write_json(
-        CONFIG_FILE,
-        data
-    )
-
-
-def valid_username(username):
-
-    if not isinstance(username, str):
-        return False
-
-    if not 1 <= len(username) <= 64:
-        return False
-
-    return re.fullmatch(
-        r"[A-Za-z0-9_.-]+",
-        username
-    ) is not None
-
-
-def valid_password(password):
-
-    if not isinstance(password, str):
-        return False
-
-    if len(password) < 10:
-        return False
-
-    if len(password) > 256:
-        return False
-
-    return True
-
-
-def generate_password(length=16):
-
-    alphabet = (
-        string.ascii_letters +
-        string.digits
-    )
-
-    return "".join(
-        secrets.choice(alphabet)
-        for _ in range(length)
-    )
-
-
-def add_user(username, password):
-
-    if not valid_username(username):
-        raise ValueError(
-            "Username ต้องประกอบด้วย A-Z, a-z, 0-9, _ . -"
-        )
-
-    if not valid_password(password):
-        raise ValueError(
-            "Password ต้องมีอย่างน้อย 10 ตัวอักษร"
-        )
-
-    data = load_config()
-
-    if username in data["users"]:
-        raise ValueError(
-            "Username นี้มีอยู่แล้ว"
-        )
-
-    data["users"][username] = {
-        "password": password,
-        "enabled": True
-    }
-
-    save_config(data)
-
-    return data
-
-
-def update_password(username, password):
-
-    if not valid_password(password):
-        raise ValueError(
-            "Password ต้องมีอย่างน้อย 10 ตัวอักษร"
-        )
-
-    data = load_config()
-
-    if username not in data["users"]:
-        raise ValueError(
-            "ไม่พบ Username นี้"
-        )
-
-    data["users"][username]["password"] = password
-
-    save_config(data)
-
-    return data
-
-
-def remove_user(username):
-
-    data = load_config()
-
-    if username not in data["users"]:
-        raise ValueError(
-            "ไม่พบ Username นี้"
-        )
-
-    del data["users"][username]
-
-    save_config(data)
-
-    return data
-
-
-def set_user_enabled(username, enabled):
-
-    data = load_config()
-
-    if username not in data["users"]:
-        raise ValueError(
-            "ไม่พบ Username นี้"
-        )
-
-    data["users"][username]["enabled"] = bool(enabled)
-
-    save_config(data)
-
-    return data
-
-
-def get_users():
-
-    data = load_config()
-
-    result = []
-
-    for username, value in data["users"].items():
-
-        if isinstance(value, dict):
-
-            password = value.get(
-                "password",
-                ""
-            )
-
-            enabled = value.get(
-                "enabled",
-                True
-            )
-
-        else:
-
-            password = str(value)
-            enabled = True
-
-        result.append({
-            "username": username,
-            "password": password,
-            "enabled": enabled
-        })
-
-    return result
-
-
-def get_enabled_users():
-
-    return [
-        user
-        for user in get_users()
-        if user["enabled"]
-    ]
-
-
-def get_user(username):
-
-    data = load_config()
-
-    user = data["users"].get(username)
-
-    if user is None:
-        return None
-
-    if isinstance(user, dict):
-
-        return {
-            "username": username,
-            "password": user.get(
-                "password",
-                ""
-            ),
-            "enabled": user.get(
-                "enabled",
-                True
-            )
-        }
-
-    return {
-        "username": username,
-        "password": str(user),
-        "enabled": True
-    }
-
-
-def build_hysteria_auth():
-
-    auth = {}
-
-    for user in get_enabled_users():
-
-        username = user["username"]
-        password = user["password"]
-
-        auth[username] = password
-
-    return auth
-
-
-def uri_escape(value):
-
-    return quote(
-        str(value),
-        safe=""
-    )
-
-
-def build_uri(username):
-
-    data = load_config()
-    server = data["server"]
-
-    domain = server.get("domain", "")
-    port = server.get(
-        "port_hopping",
-        "10000-65000"
-    )
-
-    obfs = server.get(
-        "obfs",
-        ""
-    )
-
-    password_data = get_user(username)
-
-    if password_data is None:
-        raise ValueError(
-            "ไม่พบ Username"
-        )
-
-    password = password_data["password"]
-
-    user_enc = uri_escape(username)
-    pass_enc = uri_escape(password)
-    domain_enc = domain
-
-    obfs_enc = uri_escape(obfs)
-
-    return (
-        f"hysteria2://"
-        f"{user_enc}:{pass_enc}"
-        f"@{domain_enc}:{port}/"
-        f"?obfs=salamander"
-        f"&obfs-password={obfs_enc}"
-        f"&insecure=1"
-        f"&sni={domain_enc}"
-    )
-
-
-def migrate_old_password(old_password, username="user1"):
-
-    data = load_config()
-
-    if data["users"]:
-        return False
-
-    if not old_password:
-        return False
-
-    if not valid_password(old_password):
-        return False
-
-    data["users"][username] = {
-        "password": old_password,
-        "enabled": True
-    }
-
-    save_config(data)
-
-    return True
-
-
-if __name__ == "__main__":
-
-    data = load_config()
-
-    print(
-        json.dumps(
-            data,
-            indent=2,
-            ensure_ascii=False
-        )
-    )
-PY
-
-chmod 700 "$VOLT_AUTH"
-}
-
-
-# ------------------------------------------------------------
-# สร้าง cfgupt.py
-# ------------------------------------------------------------
-
-install_volt_cfgupt_py() {
-
-cat <<'PY' > "$VOLT_CFGUPT"
-#!/usr/bin/env python3
-
-import getpass
-import json
-import os
-import secrets
-import string
-import subprocess
-import sys
-
-sys.path.insert(
-    0,
-    "/etc/volt"
-)
-
-import auth
-
-
-CONFIG_FILE = "/etc/volt/config.json"
-HY_CONFIG = "/etc/hysteria/config.json"
-
-
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-RED = "\033[91m"
-CYAN = "\033[96m"
-BLUE = "\033[94m"
-WHITE = "\033[97m"
-RESET = "\033[0m"
-BOLD = "\033[1m"
-
-
-def clear():
-
-    os.system("clear")
-
-
-def header():
-
-    clear()
-
-    print()
-    print(
-        f"{CYAN}{BOLD}"
-        "=============================================="
-        f"{RESET}"
-    )
-
-    print(
-        f"{CYAN}{BOLD}"
-        "       Voltssh-X Hysteria 2"
-        f"{RESET}"
-    )
-
-    print(
-        f"{CYAN}{BOLD}"
-        "       User / Password Manager"
-        f"{RESET}"
-    )
-
-    print(
-        f"{CYAN}{BOLD}"
-        "=============================================="
-        f"{RESET}"
-    )
-
-    print()
-
-
-def pause():
-
-    input(
-        f"\n{YELLOW}"
-        "กด Enter เพื่อดำเนินการต่อ..."
-        f"{RESET}"
-    )
-
-
-def random_password(length=16):
-
-    alphabet = (
-        string.ascii_letters +
-        string.digits
-    )
-
-    return "".join(
-        secrets.choice(alphabet)
-        for _ in range(length)
-    )
-
-
-def restart_hysteria():
-
-    try:
-
-        subprocess.run(
-            [
-                "systemctl",
-                "restart",
-                "hysteria"
-            ],
-            check=False
-        )
-
-        return True
-
-    except Exception:
-
-        return False
-
-
-def check_config():
-
-    try:
-
-        result = subprocess.run(
-            [
-                "/usr/local/bin/hysteria",
-                "server",
-                "-c",
-                HY_CONFIG,
-                "check"
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False
-        )
-
-        print(result.stdout)
-
-        return result.returncode == 0
-
-    except Exception:
-
-        return True
-
-
-def generate_hysteria_config():
-
-    data = auth.load_config()
-
-    server = data["server"]
-
-    listen = (
-        f":{server.get('port_hopping', '10000-65000')}"
-    )
-
-    users = auth.build_hysteria_auth()
-
-    config = {
-
-        "listen": listen,
-
-        "tls": {
-            "cert": "/etc/hysteria/hysteria.server.crt",
-            "key": "/etc/hysteria/hysteria.server.key"
-        },
-
-        "auth": {
-            "type": "userpass",
-            "userpass": users
-        },
-
-        "obfs": {
-            "type": "salamander",
-            "salamander": {
-                "password": server.get(
-                    "obfs",
-                    ""
-                )
-            }
-        },
-
-        "bandwidth": {
-            "up": server.get(
-                "bandwidth_up",
-                "100 mbps"
-            ),
-            "down": server.get(
-                "bandwidth_down",
-                "100 mbps"
-            )
-        },
-
-        "disableUDP": False
-    }
-
-    os.makedirs(
-        os.path.dirname(HY_CONFIG),
-        exist_ok=True
-    )
-
-    temporary = HY_CONFIG + ".tmp"
-
-    with open(
-        temporary,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            config,
-            f,
-            indent=2,
-            ensure_ascii=False
-        )
-
-        f.write("\n")
-
-    os.chmod(
-        temporary,
-        0o600
-    )
-
-    os.replace(
-        temporary,
-        HY_CONFIG
-    )
-
-    return config
-
-
-def apply_changes():
-
-    print(
-        f"{YELLOW}"
-        "กำลังสร้าง Hysteria configuration..."
-        f"{RESET}"
-    )
-
-    try:
-
-        generate_hysteria_config()
-
-    except Exception as e:
-
-        print(
-            f"{RED}"
-            f"ไม่สามารถสร้าง config: {e}"
-            f"{RESET}"
-        )
-
-        return False
-
-    print(
-        f"{GREEN}"
-        "สร้าง config สำเร็จ"
-        f"{RESET}"
-    )
-
-    print(
-        f"{YELLOW}"
-        "กำลังตรวจสอบ configuration..."
-        f"{RESET}"
-    )
-
-    if not check_config():
-
-        print(
-            f"{RED}"
-            "Configuration ไม่ผ่านการตรวจสอบ"
-            f"{RESET}"
-        )
-
-        return False
-
-    print(
-        f"{GREEN}"
-        "Configuration ถูกต้อง"
-        f"{RESET}"
-    )
-
-    print(
-        f"{YELLOW}"
-        "กำลัง restart Hysteria..."
-        f"{RESET}"
-    )
-
-    restart_hysteria()
-
-    print(
-        f"{GREEN}"
-        "Hysteria restart แล้ว"
-        f"{RESET}"
-    )
-
-    return True
-
-
-def list_users():
-
-    header()
-
-    users = auth.get_users()
-
-    if not users:
-
-        print(
-            f"{YELLOW}"
-            "ยังไม่มีผู้ใช้งาน"
-            f"{RESET}"
-        )
-
-        pause()
-        return
-
-    print(
-        f"{WHITE}{BOLD}"
-        "รายการผู้ใช้งาน"
-        f"{RESET}"
-    )
-
-    print()
-
-    for index, user in enumerate(
-        users,
-        start=1
-    ):
-
-        status = (
-            f"{GREEN}ON{RESET}"
-            if user["enabled"]
-            else
-            f"{RED}OFF{RESET}"
-        )
-
-        print(
-            f"{CYAN}{index:03d}.{RESET} "
-            f"{WHITE}{user['username']}{RESET} "
-            f"[{status}]"
-        )
-
-    print()
-
-    pause()
-
-
-def add_user():
-
-    header()
-
-    print(
-        f"{CYAN}"
-        "เพิ่ม Username / Password"
-        f"{RESET}"
-    )
-
-    print()
-
-    while True:
-
-        username = input(
-            "Username: "
-        ).strip()
-
-        if not auth.valid_username(
-            username
-        ):
-
-            print(
-                f"{RED}"
-                "Username ไม่ถูกต้อง"
-                f"{RESET}"
-            )
-
-            continue
-
-        if auth.get_user(
-            username
-        ) is not None:
-
-            print(
-                f"{RED}"
-                "Username นี้มีอยู่แล้ว"
-                f"{RESET}"
-            )
-
-            continue
-
-        break
-
-    print()
-
-    print(
-        "เลือกวิธีสร้าง Password"
-    )
-
-    print(
-        "1. กรอก Password เอง"
-    )
-
-    print(
-        "2. สร้าง Password อัตโนมัติ"
-    )
-
-    choice = input(
-        "\nเลือก [1-2]: "
-    ).strip()
-
-    if choice == "2":
-
-        password = random_password(20)
-
-        print()
-        print(
-            f"{GREEN}"
-            f"Password: {password}"
-            f"{RESET}"
-        )
-
-    else:
-
-        while True:
-
-            password = getpass.getpass(
-                "Password: "
-            )
-
-            if not auth.valid_password(
-                password
-            ):
-
-                print(
-                    f"{RED}"
-                    "Password ต้องมีอย่างน้อย "
-                    "10 ตัวอักษร"
-                    f"{RESET}"
-                )
-
-                continue
-
-            password2 = getpass.getpass(
-                "ยืนยัน Password: "
-            )
-
-            if password != password2:
-
-                print(
-                    f"{RED}"
-                    "Password ไม่ตรงกัน"
-                    f"{RESET}"
-                )
-
-                continue
-
-            break
-
-    try:
-
-        auth.add_user(
-            username,
-            password
-        )
-
-    except Exception as e:
-
-        print(
-            f"{RED}"
-            f"ไม่สามารถเพิ่ม user: {e}"
-            f"{RESET}"
-        )
-
-        pause()
-        return
-
-    if apply_changes():
-
-        print()
-        print(
-            f"{GREEN}"
-            "เพิ่มผู้ใช้งานสำเร็จ"
-            f"{RESET}"
-        )
-
-        print()
-        print(
-            f"{WHITE}"
-            f"Username : {username}"
-            f"{RESET}"
-        )
-
-        print(
-            f"{WHITE}"
-            f"Password : {password}"
-            f"{RESET}"
-        )
-
-        try:
-
-            print()
-            print(
-                f"{CYAN}"
-                "URI:"
-                f"{RESET}"
-            )
-
-            print(
-                auth.build_uri(
-                    username
-                )
-            )
-
-        except Exception:
-            pass
-
-    pause()
-
-
-def change_password():
-
-    header()
-
-    username = input(
-        "Username ที่ต้องการเปลี่ยน Password: "
-    ).strip()
-
-    user = auth.get_user(
-        username
-    )
-
-    if user is None:
-
-        print(
-            f"{RED}"
-            "ไม่พบ Username นี้"
-            f"{RESET}"
-        )
-
-        pause()
-        return
-
-    while True:
-
-        password = getpass.getpass(
-            "Password ใหม่: "
-        )
-
-        if not auth.valid_password(
-            password
-        ):
-
-            print(
-                f"{RED}"
-                "Password ต้องมีอย่างน้อย "
-                "10 ตัวอักษร"
-                f"{RESET}"
-            )
-
-            continue
-
-        password2 = getpass.getpass(
-            "ยืนยัน Password ใหม่: "
-        )
-
-        if password != password2:
-
-            print(
-                f"{RED}"
-                "Password ไม่ตรงกัน"
-                f"{RESET}"
-            )
-
-            continue
-
-        break
-
-    try:
-
-        auth.update_password(
-            username,
-            password
-        )
-
-    except Exception as e:
-
-        print(
-            f"{RED}"
-            f"{e}"
-            f"{RESET}"
-        )
-
-        pause()
-        return
-
-    if apply_changes():
-
-        print()
-        print(
-            f"{GREEN}"
-            "เปลี่ยน Password สำเร็จ"
-            f"{RESET}"
-        )
-
-        print(
-            f"{CYAN}"
-            "URI:"
-            f"{RESET}"
-        )
-
-        try:
-
-            print(
-                auth.build_uri(
-                    username
-                )
-            )
-
-        except Exception:
-            pass
-
-    pause()
-
-
-def remove_user():
-
-    header()
-
-    username = input(
-        "Username ที่ต้องการลบ: "
-    ).strip()
-
-    user = auth.get_user(
-        username
-    )
-
-    if user is None:
-
-        print(
-            f"{RED}"
-            "ไม่พบ Username นี้"
-            f"{RESET}"
-        )
-
-        pause()
-        return
-
-    print()
-
-    print(
-        f"{YELLOW}"
-        f"กำลังจะลบ: {username}"
-        f"{RESET}"
-    )
-
-    confirm = input(
-        "ยืนยันหรือไม่ [y/N]: "
-    ).strip().lower()
-
-    if confirm != "y":
-
-        print(
-            "ยกเลิก"
-        )
-
-        pause()
-        return
-
-    try:
-
-        auth.remove_user(
-            username
-        )
-
-    except Exception as e:
-
-        print(
-            f"{RED}"
-            f"{e}"
-            f"{RESET}"
-        )
-
-        pause()
-        return
-
-    if apply_changes():
-
-        print()
-        print(
-            f"{GREEN}"
-            "ลบผู้ใช้งานสำเร็จ"
-            f"{RESET}"
-        )
-    pause()
-def toggle_user():
-    header()
-    username = input(
-        "Username: "
-    ).strip()
-    user = auth.get_user(
-        username
-    )
-    if user is None:
-        print(
-            f"{RED}"
-            "ไม่พบ Username นี้"
-            f"{RESET}"
-        )
-        pause()
-        return
-    new_state = not user["enabled"]
-    auth.set_user_enabled(
-        username,
-        new_state
-    )
-    if apply_changes():
-        state = (
-            "เปิดใช้งาน"
-            if new_state
-            else
-            "ปิดใช้งาน"
-        )
-        print(
-            f"{GREEN}"
-            f"{state} {username} สำเร็จ"
-            f"{RESET}"
-        )
-    pause()
-def show_user():
-    header()
-    username = input(
-        "Username: "
-    ).strip()
-    user = auth.get_user(
-        username
-    )
-    if user is None:
-        print(
-            f"{RED}"
-            "ไม่พบ Username นี้"
-            f"{RESET}"
-        )
-        pause()
-        return
-    print()
-    print(
-        f"{CYAN}"
-        f"Username : {user['username']}"
-        f"{RESET}"
-    )
-    print(
-        f"{CYAN}"
-        f"Password : {user['password']}"
-        f"{RESET}"
-    )
-    print(
-        f"{CYAN}"
-        f"Enabled  : {user['enabled']}"
-        f"{RESET}"
-    )
-    print()
-    try:
-        print(
-            f"{YELLOW}"
-            "URI:"
-            f"{RESET}"
-        )
-        print(
-            auth.build_uri(
-                username
-            )
-        )
-    except Exception as e:
-        print(
-            f"{RED}"
-            f"สร้าง URI ไม่สำเร็จ: {e}"
-            f"{RESET}"
-        )
-    pause()
-def show_config():
-    header()
-    try:
-        with open(
-            CONFIG_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-            data = json.load(f)
-        print(
-            json.dumps(
-                data,
-                indent=2,
-                ensure_ascii=False
-            )
-        )
-    except Exception as e:
-        print(
-            f"{RED}"
-            f"{e}"
-            f"{RESET}"
-        )
-    pause()
-def regenerate():
-    header()
-    if apply_changes():
-        print(
-            f"{GREEN}"
-            "สร้าง Configuration ใหม่สำเร็จ"
-            f"{RESET}"
-        )
-    pause()
-def main_menu():
-    while True:
-        header()
-        users = auth.get_users()
-        print(
-            f"{WHITE}"
-            f"จำนวน User: {len(users)}"
-            f"{RESET}"
-        )
-        print()
-        print(
-            f"{GREEN}"
-            "1."
-            f"{RESET} เพิ่ม User"
-        )
-        print(
-            f"{GREEN}"
-            "2."
-            f"{RESET} รายการ User"
-        )
-        print(
-            f"{GREEN}"
-            "3."
-            f"{RESET} แสดงข้อมูล User"
-        )
-        print(
-            f"{GREEN}"
-            "4."
-            f"{RESET} เปลี่ยน Password"
-        )
-        print(
-            f"{GREEN}"
-            "5."
-            f"{RESET} ลบ User"
-        )
-        print(
-            f"{GREEN}"
-            "6."
-            f"{RESET} เปิด/ปิด User"
-        )
-        print(
-            f"{GREEN}"
-            "7."
-            f"{RESET} สร้าง Hysteria Config ใหม่"
-        )
-        print(
-            f"{GREEN}"
-            "8."
-            f"{RESET} แสดง config.json"
-        )
-        print(
-            f"{RED}"
-            "0."
-            f"{RESET} ออกจากโปรแกรม"
-        )
-        print()
-        choice = input(
-            "เลือกเมนู: "
-        ).strip()
-        if choice == "1":
-            add_user()
-        elif choice == "2":
-            list_users()
-        elif choice == "3":
-            show_user()
-        elif choice == "4":
-            change_password()
-        elif choice == "5":
-            remove_user()
-        elif choice == "6":
-            toggle_user()
-        elif choice == "7":
-            regenerate()
-        elif choice == "8":
-            show_config()
-        elif choice == "0":
-            clear()
-            break
-        else:
-            print(
-                f"{RED}"
-                "เลือกเมนูไม่ถูกต้อง"
-                f"{RESET}"
-            )
-            pause()
-if __name__ == "__main__":
-    if os.geteuid() != 0:
-        print(
-            "กรุณารันด้วย root"
-        )
-        sys.exit(1)
-    main_menu()
-PY
-chmod 700 "$VOLT_CFGUPT"
-}
-# ------------------------------------------------------------
-# สร้างฐานข้อมูล config.json
-# ------------------------------------------------------------
-install_volt_config_json() {
-    if [ ! -f "$VOLT_CONFIG" ]; then
-cat <<EOF > "$VOLT_CONFIG"
-{
-  "version": 2,
-  "server": {
-    "domain": "$DOMAIN",
-    "ip": "$HYST_SERVER_IP",
-    "port": $UDP_PORT,
-    "port_hopping": "$UDP_PORT_HP",
-    "protocol": "$PROTOCOL",
-    "obfs": "$OBFS",
-    "bandwidth_up": "100 mbps",
-    "bandwidth_down": "100 mbps"
-  },
-  "users": {
-    "user1": {
-      "password": "$PASSWORD",
-      "enabled": true
-    }
-  }
-}
+tpl_server_x_svc() {
+  cat <<EOF
+[Unit]
+Description=Hysteria 2 Server (%i)
+After=network.target nss-lookup.target
+[Service]
+Type=simple
+ExecStart=$EXECUTABLE_INSTALL_PATH server --config ${CONFIG_DIR}/%i.yaml
+WorkingDirectory=$(systemd_unit_working_directory)
+User=$HYSTERIA_USER
+Group=$HYSTERIA_USER
+Environment=HYSTERIA_LOG_LEVEL=info
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
 EOF
-        chmod 600 "$VOLT_CONFIG"
+}
+
+tpl_config_yaml() {
+  local D E
+  D="$(grep -oP '^\s+-\s+\K\S+' "$CONFIG_FILE" 2>/dev/null | head -1)"
+  E="$(grep -oP 'email:\s+\K\S+' "$CONFIG_FILE" 2>/dev/null | head -1)"
+  : "${D:=your.domain.net}"; : "${E:=your@email.com}"
+  cat <<CFG
+# Hysteria 2 Config - สร้างโดย hysteria2.sh
+# จัดการผู้ใช้ผ่านเมนู → ห้ามแก้ไขส่วน auth ด้วยตัวเอง!
+
+# listen: :443
+
+acme:
+  domains:
+    - $D
+  email: $E
+
+auth:
+  type: command
+  command: "$AUTH_HELPER"
+
+acl:
+  file: $ACL_FILE
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://news.ycombinator.com/
+    rewriteHost: true
+
+bandwidth:
+  up: 1000 mbps
+  down: 1000 mbps
+
+udpIdleTimeout: 300s
+CFG
+}
+
+tpl_acl() {
+  cat <<'ACL'
+# Hysteria 2 ACL
+reject(10.0.0.0/8)
+reject(172.16.0.0/12)
+reject(192.168.0.0/16)
+reject(127.0.0.0/8)
+reject(169.254.0.0/16)
+reject(fd00::/8)
+reject(::1/128)
+reject(fe80::/10)
+reject(all, tcp/22)
+reject(all, tcp/25)
+reject(all, tcp/23)
+direct(all)
+ACL
+}
+
+build_all_configs() {
+  init_user_db
+  build_auth_helper
+  mkdir -p "$CONFIG_DIR"
+  install_content -Dm640 "$(tpl_config_yaml)"  "$CONFIG_FILE" "1"
+  install_content -Dm644 "$(tpl_acl)"          "$ACL_FILE"    "1"
+  install_content -Dm644 "$(tpl_server_svc)"   "$SYSTEMD_SERVICES_DIR/hysteria-server.service" "1"
+  install_content -Dm644 "$(tpl_server_x_svc)" "$SYSTEMD_SERVICES_DIR/hysteria-server@.service" "1"
+  if [[ -n "$SECONTEXT_SYSTEMD_UNIT" ]]; then
+    chcon "$SECONTEXT_SYSTEMD_UNIT" "$SYSTEMD_SERVICES_DIR/hysteria-server.service" 2>/dev/null || true
+    chcon "$SECONTEXT_SYSTEMD_UNIT" "$SYSTEMD_SERVICES_DIR/hysteria-server@.service" 2>/dev/null || true
+  fi
+  systemctl daemon-reload
+
+  # cron หมดอายุอัตโนมัติ
+  cat > "$CRON_FILE" <<CRON
+0 3 * * * root [ -f $USER_DB ] && sed -i -E '/\|([0-9]{4}-[0-9]{2}-[0-9]{2})\$/ { s/^/EXPIRED_/; }' $USER_DB 2>/dev/null; systemctl restart hysteria-server >/dev/null 2>&1 || true
+CRON
+  chmod 644 "$CRON_FILE"
+  systemctl restart cron >/dev/null 2>&1 || systemctl restart crond >/dev/null 2>&1 || true
+
+  chown -R "$HYSTERIA_USER":"$HYSTERIA_USER" "$CONFIG_DIR" 2>/dev/null || true
+  ok "สร้างไฟล์การตั้งค่าทั้งหมดเสร็จ"
+}
+
+apply_changes() {
+  build_all_configs
+  if is_hysteria_installed; then
+    msg "🔄 รีสตาร์ทบริการ..."
+    if systemctl restart hysteria-server 2>/dev/null; then
+      ok "รีสตาร์ทสำเร็จ"
+      sleep 1
+      systemctl is-active --quiet hysteria-server && ok "บริการปกติ ✅" || warn "ยังไม่ขึ้น → journalctl -u hysteria-server -f"
     else
-        python3 - "$VOLT_CONFIG" "$DOMAIN" "$HYST_SERVER_IP" "$UDP_PORT" "$UDP_PORT_HP" "$PROTOCOL" "$OBFS" <<'PY'
-import json
-import sys
-path = sys.argv[1]
-domain = sys.argv[2]
-server_ip = sys.argv[3]
-port = int(sys.argv[4])
-port_hopping = sys.argv[5]
-protocol = sys.argv[6]
-obfs = sys.argv[7]
-try:
-    with open(
-        path,
-        "r",
-        encoding="utf-8"
-    ) as f:
-        data = json.load(f)
-except Exception:
-    data = {
-        "version": 2,
-        "server": {},
-        "users": {}
-    }
-data.setdefault(
-    "version",
-    2
-)
-data.setdefault(
-    "server",
-    {}
-)
-data.setdefault(
-    "users",
-    {}
-)
-data["server"].update({
-    "domain": domain,
-    "ip": server_ip,
-    "port": port,
-    "port_hopping": port_hopping,
-    "protocol": protocol,
-    "obfs": obfs,
-    "bandwidth_up": "100 mbps",
-    "bandwidth_down": "100 mbps"
-})
-if not data["users"]:
-    data["users"]["user1"] = {
-        "password": "",
-        "enabled": True
-    }
-tmp = path + ".tmp"
-with open(
-    tmp,
-    "w",
-    encoding="utf-8"
-) as f:
-    json.dump(
-        data,
-        f,
-        indent=2,
-        ensure_ascii=False
-    )
-    f.write("\n")
-import os
-os.chmod(
-    tmp,
-    0o600
-)
-os.replace(
-    tmp,
-    path
-)
-PY
+      warn "รีสตาร์ทไม่ได้ → systemctl enable --now hysteria-server"
     fi
+  else
+    note "ยังไม่ติดตั้ง binary → เมนู 1"
+  fi
 }
-# ------------------------------------------------------------
-# สร้าง Hysteria config จาก config.json
-# ------------------------------------------------------------
-generate_hysteria_config_from_users() {
-    python3 <<'PY'
-import sys
-import os
-sys.path.insert(
-    0,
-    "/etc/volt"
-)
-import auth
-data = auth.load_config()
-users = auth.build_hysteria_auth()
-if not users:
-    print(
-        "ERROR: ต้องมี User อย่างน้อย 1 รายการ",
-        file=sys.stderr
-    )
-    sys.exit(1)
-server = data["server"]
-config = {
-    "listen": ":" + str(
-        server.get(
-            "port_hopping",
-            "10000-65000"
-        )
-    ),
-    "tls": {
-        "cert": "/etc/hysteria/hysteria.server.crt",
-        "key": "/etc/hysteria/hysteria.server.key"
-    },
-    "auth": {
-        "type": "userpass",
-        "userpass": users
-    },
-    "obfs": {
-        "type": "salamander",
-        "salamander": {
-            "password": server.get(
-                "obfs",
-                ""
-            )
-        }
-    },
-    "bandwidth": {
-        "up": server.get(
-            "bandwidth_up",
-            "100 mbps"
-        ),
-        "down": server.get(
-            "bandwidth_down",
-            "100 mbps"
-        )
-    },
-    "disableUDP": False
+
+
+### ============================================================
+### 🧑‍🤝‍🧑 เมนูจัดการผู้ใช้ (4 ฟีเจอร์ที่คุณขอ)
+### ============================================================
+input_required() {
+  local v=""
+  while [[ -z "$v" ]]; do
+    read -rp "   $1 " v
+    v="${v:-${2:-}}"
+    [[ -z "$v" && -z "$2" ]] && fail "ห้ามเว้นว่าง"
+  done
+  echo "$v"
 }
-path = "/etc/hysteria/config.json"
-tmp = path + ".tmp"
-os.makedirs(
-    "/etc/hysteria",
-    exist_ok=True
-)
-import json
-with open(
-    tmp,
-    "w",
-    encoding="utf-8"
-) as f:
-    json.dump(
-        config,
-        f,
-        indent=2,
-        ensure_ascii=False
-    )
-    f.write("\n")
-os.chmod(
-    tmp,
-    0o600
-)
-os.replace(
-    tmp,
-    path
-)
-print(
-    "Hysteria configuration generated successfully"
-)
-PY
+valid_date() {
+  [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+  date -d "$1" "+%Y-%m-%d" >/dev/null 2>&1
 }
-# ------------------------------------------------------------
-# ติดตั้งระบบทั้งหมด
-# ------------------------------------------------------------
-install_volt_multi_user() {
-    echo ""
-    echo "=============================================="
-    echo "   ติดตั้ง Voltssh-X Multi User System"
-    echo "=============================================="
-    echo ""
-    install_volt_python_dependencies
-    install_volt_auth_py
-    install_volt_cfgupt_py
-    install_volt_config_json
-    generate_hysteria_config_from_users
-    chmod 700 "$VOLT_AUTH"
-    chmod 700 "$VOLT_CFGUPT"
-    chmod 600 "$VOLT_CONFIG"
-    chmod 600 "$HY_CONFIG"
-    echo ""
-    echo "ติดตั้ง Multi User Authentication สำเร็จ"
-    echo ""
+
+list_simple() {
+  echo "   ผู้ใช้ปัจจุบัน:"
+  while IFS='|' read -r u _ _ e _; do
+    [[ -z "$u" ]] && continue
+    [[ "$e" == "0000-00-00" ]] && e="ไม่จำกัด"
+    echo "     • $u  (หมดอายุ: $e)"
+  done < "$USER_DB"
 }
-# ------------------------------------------------------------
-# คำสั่ง volt
-# ------------------------------------------------------------
-install_volt_command() {
-cat <<'SH' > /usr/local/bin/volt-user
-#!/bin/bash
-exec python3 /etc/volt/cfgupt.py "$@"
-SH
-chmod 755 /usr/local/bin/volt-user
+
+menu_add() {
+  line; msg "➕ เพิ่มผู้ใช้ใหม่"
+  local u p ips exp note
+  while :; do
+    u="$(input_required "ชื่อผู้ใช้ (ภาษาอังกฤษ): ")"
+    user_exists "$u" && fail "มีชื่อนี้อยู่แล้ว" || break
+  done
+  p="$(input_required "รหัสผ่าน (Enter = สุ่ม): " "$(generate_random_password)")"
+  read -rp "   IP ที่อนุญาต (คั่นด้วย , เว้นว่าง = ไม่จำกัด): " ips; ips="${ips// /}"
+  while :; do
+    read -rp "   วันหมดอายุ (YYYY-MM-DD / 0 = ไม่หมด): " exp
+    exp="${exp:-0}"
+    [[ "$exp" == "0" ]] && { exp="0000-00-00"; break; }
+    valid_date "$exp" && break || fail "รูปแบบผิด เช่น $(date -d '+30 days' +%Y-%m-%d)"
+  done
+  read -rp "   หมายเหตุ: " note
+
+  add_user_db "$u" "$p" "$ips" "$exp" "$note"
+  line; ok "เพิ่ม [$u] เสร็จ"
+  echo "   👤 User: $u   🔑 Pass: $p"
+  [[ -n "$ips" ]] && echo "   🌐 IP: $ips" || echo "   🌐 IP: ไม่จำกัด"
+  [[ "$exp" == "0000-00-00" ]] && echo "   ⏰ หมดอายุ: ไม่มีกำหนด" || echo "   ⏰ หมดอายุ: $exp"
+  echo "   🔗 URI: hysteria2://${u}:${p}@โดเมนคุณ:443/?sni=โดเมนคุณ#${u}"
+  echo
+  read -rp "นำไปใช้งานทันที? (Y/n): " a
+  [[ "${a,,}" != "n" ]] && apply_changes
+  pause
 }
-# ------------------------------------------------------------
-# เรียกใช้งาน
-# ------------------------------------------------------------
-install_volt_multi_user
-install_volt_command
-        get_running_services() {
-            if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]]; then
-                return
-            fi
-            systemctl list-units --state=active --plain --no-legend |
-                grep -o "hysteria-server@*[^\s]*.service" || true
-        }
-        restart_running_services() {
-            if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]]; then
-                return
-            fi
-            echo "กำลังรีสตาร์ทบริการที่กำลังทำงาน ... "
-            for service in $(get_running_services); do
-                echo -ne "กำลังรีสตาร์ท $service ... "
-                systemctl restart "$service"
-                echo "เสร็จสิ้น"
-            done
-        }
-        stop_running_services() {
-            if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]]; then
-                return
-            fi
-            echo "กำลังหยุดบริการที่กำลังทำงาน ... "
-            for service in $(get_running_services); do
-                echo -ne "กำลังหยุด $service ... "
-                systemctl stop "$service"
-                echo "เสร็จสิ้น"
-            done
-        }
-        is_hysteria_installed() {
-            if [[ -f "$EXECUTABLE_INSTALL_PATH" || -L "$EXECUTABLE_INSTALL_PATH" ]]; then
-                return 0
-            fi
-            return 1
-        }
-        get_installed_version() {
-            if is_hysteria_installed; then
-                "$EXECUTABLE_INSTALL_PATH" -v | cut -d ' ' -f 3
-            fi
-        }
-        get_latest_version() {
-            if [[ -n "$VERSION" ]]; then
-                echo "$VERSION"
-                return
-            fi
-            local _tmpfile=$(mktemp)
-            if ! curl -sS \
-                -H 'Accept: application/vnd.github.v3+json' \
-                "$API_BASE_URL/releases/latest" \
-                -o "$_tmpfile"; then
-                error "ไม่สามารถตรวจสอบเวอร์ชันล่าสุดได้ กรุณาตรวจสอบเครือข่าย"
-                exit 11
-            fi
-            local _latest_version=$(grep 'tag_name' "$_tmpfile" |
-                head -1 | grep -o '"v.*"')
-            _latest_version=${_latest_version#'"'}
-            _latest_version=${_latest_version%'"'}
-            if [[ -n "$_latest_version" ]]; then
-                echo "$_latest_version"
-            fi
-            rm -f "$_tmpfile"
-        }
-get_latest_version() {
-    if [[ -n "$VERSION" ]]; then
-        echo "$VERSION"
-        return
-    fi
-    local _latest_version
-    _latest_version="$(
-        command curl -fsSL \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "$API_BASE_URL/releases/latest" |
-            grep -o '"tag_name":[[:space:]]*"[^"]*"' |
-            head -1 |
-            sed -E 's/.*"tag_name":[[:space:]]*"([^"]*)".*/\1/'
-    )"
-    if [[ -z "$_latest_version" ]]; then
-        error "ไม่สามารถตรวจสอบเวอร์ชัน Hysteria ล่าสุดจาก GitHub ได้"
-        exit 11
-    fi
-    echo "$_latest_version"
+
+menu_del() {
+  line; msg "🗑️  ลบผู้ใช้"
+  [[ "$(count_users)" -eq 0 ]] && { warn "ยังไม่มีผู้ใช้"; pause; return; }
+  list_simple
+  local u="$(input_required "ชื่อผู้ใช้ที่จะลบ: ")"
+  user_exists "$u" || { fail "ไม่พบ [$u]"; pause; return; }
+  read -rp "   พิมพ์ YES เพื่อยืนยันลบ [$u]: " ans
+  [[ "$ans" == "YES" ]] || { warn "ยกเลิก"; pause; return; }
+  del_user_db "$u"; ok "ลบ [$u] เสร็จ"
+  read -rp "นำไปใช้งานทันที? (Y/n): " a
+  [[ "${a,,}" != "n" ]] && apply_changes
+  pause
 }
-        download_hysteria() {
-            local _version="$1"
-            local _destination="$2"
-            local _download_url="$REPO_URL/releases/download/$_version/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
-            echo "กำลังดาวน์โหลด Hysteria: $_download_url ..."
-            if ! curl -R \
-                -H 'Cache-Control: no-cache' \
-                "$_download_url" \
-                -o "$_destination"; then
-                error "ดาวน์โหลดไม่สำเร็จ! กรุณาตรวจสอบเครือข่ายแล้วลองใหม่"
-                return 11
-            fi
-            return 0
-        }
-        perform_install_hysteria_binary() {
-    if [[ -n "$LOCAL_FILE" ]]; then
-        note "กำลังใช้ไฟล์ภายในเครื่อง: $LOCAL_FILE"
-        echo -ne "กำลังติดตั้งไฟล์ Hysteria ... "
-        if install -Dm755 "$LOCAL_FILE" "$EXECUTABLE_INSTALL_PATH"; then
-            echo "สำเร็จ"
-        else
-            exit 2
-        fi
-        return
-    fi
-    local _tmpfile
-    _tmpfile=$(mktemp)
-    VERSION="$(get_latest_version)"
-    echo "ตรวจพบ Hysteria เวอร์ชันล่าสุด: $VERSION"
-    if ! download_hysteria "$VERSION" "$_tmpfile"; then
-        rm -f "$_tmpfile"
-        exit 11
-    fi
-    echo -ne "กำลังติดตั้งไฟล์ Hysteria $VERSION ... "
-    if install -Dm755 "$_tmpfile" "$EXECUTABLE_INSTALL_PATH"; then
-        echo "สำเร็จ"
-    else
-        rm -f "$_tmpfile"
-        exit 13
-    fi
-    rm -f "$_tmpfile"
+
+menu_list() {
+  line
+  local n="$(count_users)"
+  msg "📋 รายชื่อผู้ใช้ทั้งหมด ($n คน)"
+  [[ "$n" -eq 0 ]] && { echo "   (ว่างเปล่า)"; pause; return; }
+  printf "   %-3s %-14s %-14s %-20s %-12s %s\n" "ที่" "User" "Password" "IP" "หมดอายุ" "Note"
+  printf "   %-3s %-14s %-14s %-20s %-12s %s\n" "───" "────────────" "────────────" "────────────────────" "────────────" "──────────"
+  local i=0
+  while IFS='|' read -r u p ips e nt; do
+    [[ -z "$u" ]] && continue; ((i++))
+    [[ "$e" == "0000-00-00" ]] && e="ไม่จำกัด"
+    [[ -z "$ips" ]] && ips="ไม่จำกัด"
+    [[ "$e" != "ไม่จำกัด" ]] && valid_date "$e" && [[ "$(date +%Y-%m-%d)" > "$e" ]] && e="❌ $e"
+    printf "   %-3s %-14s %-14s %-20s %-12s %s\n" "$i" "$u" "$p" "${ips:0:20}" "$e" "${nt:0:18}"
+  done < "$USER_DB"
+  echo; pause
 }
-        tpl_etc_hysteria_config_json() {
-    cat /etc/hysteria/config.json
+
+menu_ip() {
+  line; msg "🌐 จำกัด IP ต่อผู้ใช้"
+  [[ "$(count_users)" -eq 0 ]] && { warn "ยังไม่มีผู้ใช้"; pause; return; }
+  list_simple
+  local u="$(input_required "เลือก User: ")"
+  user_exists "$u" || { fail "ไม่พบ [$u]"; pause; return; }
+  local old="$(get_user_field "$u" 3)"; [[ -z "$old" ]] && old="(ไม่จำกัด)"
+  echo "   IP ปัจจุบัน: $old"
+  read -rp "   IP ใหม่ (, คั่น / เว้นว่าง = ไม่จำกัด / CIDR ได้): " ips; ips="${ips// /}"
+  set_user_field "$u" 3 "$ips"
+  [[ -z "$ips" ]] && ok "เปิดให้ทุก IP" || ok "ตั้ง IP = $ips"
+  read -rp "นำไปใช้งานทันที? (Y/n): " a
+  [[ "${a,,}" != "n" ]] && apply_changes
+  pause
 }
-        perform_install_hysteria_systemd() {
-            if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]]; then
-                return
-            fi
-            install_content -Dm644 \
-                "$(tpl_hysteria_server_service)" \
-                "$SYSTEMD_SERVICES_DIR/hysteria.service"
-            install_content -Dm644 \
-                "$(tpl_hysteria_server_x_service)" \
-                "$SYSTEMD_SERVICES_DIR/hysteria@.service"
-            systemctl daemon-reload
-        }
-        perform_remove_hysteria_systemd() {
-            remove_file "$SYSTEMD_SERVICES_DIR/hysteria.service"
-            remove_file "$SYSTEMD_SERVICES_DIR/hysteria@.service"
-            systemctl daemon-reload
-        }
-        perform_install_hysteria_home_legacy() {
-            if ! is_user_exists "$HYSTERIA_USER"; then
-                echo -ne "กำลังสร้างผู้ใช้ $HYSTERIA_USER ... "
-                useradd -r -d "$HYSTERIA_HOME_DIR" -m "$HYSTERIA_USER"
-                echo "สำเร็จ"
-            fi
-        }
-        perform_install() {
-            local _is_frash_install
-            if ! is_hysteria_installed; then
-                _is_frash_install=1
-            fi
-            perform_install_hysteria_binary
-            perform_install_hysteria_home_legacy
-            perform_install_hysteria_systemd
-            setup_ssl
-            start_services
-        }
-        setup_ssl() {
-            echo "กำลังสร้าง SSL Certificate..."
-            openssl genrsa \
-                -out /etc/hysteria/hysteria.ca.key 2048
-            openssl req -new -x509 -days 3650 \
-                -key /etc/hysteria/hysteria.ca.key \
-                -subj "/C=CN/ST=GD/L=SZ/O=Hysteria, Inc./CN=Hysteria Root CA" \
-                -out /etc/hysteria/hysteria.ca.crt
-            openssl req -newkey rsa:2048 -nodes \
-                -keyout /etc/hysteria/hysteria.server.key \
-                -subj "/C=CN/ST=GD/L=SZ/O=Hysteria, Inc./CN=$DOMAIN" \
-                -out /etc/hysteria/hysteria.server.csr
-            openssl x509 -req \
-                -extfile <(printf "subjectAltName=DNS:$DOMAIN,DNS:$DOMAIN") \
-                -days 3650 \
-                -in /etc/hysteria/hysteria.server.csr \
-                -CA /etc/hysteria/hysteria.ca.crt \
-                -CAkey /etc/hysteria/hysteria.ca.key \
-                -CAcreateserial \
-                -out /etc/hysteria/hysteria.server.crt
-        }
-        start_services() {
-            echo "กำลังตั้งค่าและเริ่มบริการ Hysteria..."
-            apt update
-     sudo debconf-set-selections <<<"iptables-persistent iptables-persistent/autosave_v4 boolean true"
-     sudo debconf-set-selections <<<"iptables-persistent iptables-persistent/autosave_v6 boolean true"
-            sudo apt -y install iptables-persistent
-            iptables -t nat -A PREROUTING \
-                -i $(ip -4 route ls | grep default |
-                grep -Po '(?<=dev )(\S+)' | head -1) \
-                -p udp --dport 10000:65000 \
-                -j DNAT --to-destination $UDP_PORT
-            ip6tables -t nat -A PREROUTING \
-                -i $(ip -4 route ls | grep default |
-                grep -Po '(?<=dev )(\S+)' | head -1) \
-                -p udp --dport 10000:65000 \
-                -j DNAT --to-destination $UDP_PORT
-            sysctl net.ipv4.conf.all.rp_filter=0
-            sysctl net.ipv4.conf.$(ip -4 route ls |
-                grep default |
-                grep -Po '(?<=dev )(\S+)' |
-                head -1).rp_filter=0
-            echo "net.ipv4.ip_forward = 1
-net.ipv4.conf.all.rp_filter=0
-net.ipv4.conf.$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1).rp_filter=0" >/etc/sysctl.conf
-            sysctl -p
-            sudo iptables-save >/etc/iptables/rules.v4
-            sudo ip6tables-save >/etc/iptables/rules.v6
-            systemctl enable hysteria.service
-            systemctl start hysteria.service
-        }
-        volt() {
-            clear
-            figlet -k volt-udp |
-                awk '{gsub(/./,"\033[3"int(rand()*5+1)"m&\033[0m")}1' &&
-            figlet -k hysteria |
-                awk '{gsub(/./,"\033[3"int(rand()*5+1)"m&\033[0m")}1'
-            echo ""
-            echo -e "\033[1;32m[\033[1;32mสำเร็จ ✅\033[1;32m] \033[1;37m ⇢  \033[1;33mกำลังตรวจสอบไฟล์ที่จำเป็น...\033[0m"
-            echo -e "\033[1;32m      ♻️ \033[1;37m      \033[1;33mกรุณารอสักครู่...\033[0m"
-            echo ""
-            wget -O /usr/bin/volt --no-cache \
-                'https://raw.githubusercontent.com/benzvpn/Edit-UDP-Hysteria/main/lib/volt.so' \
-                &>/dev/null
-            wget -O /etc/volt/cfgupt.py --no-cache \
-                'https://raw.githubusercontent.com/benzvpn/Edit-UDP-Hysteria/main/lib/cfgupt.py' \
-                &>/dev/null
-            chmod +x /usr/bin/volt &>/dev/null
-            chmod +x /etc/volt/cfgupt.py &>/dev/null
-            echo ""
-        }
-        voltx_hysteria_inst() {
-            check_permission
-            check_environment
-            check_hysteria_user "hysteria"
-            check_hysteria_homedir "/var/lib/$HYSTERIA_USER"
-            perform_install
-            volt
-        }
-        voltx_hysteria_inst
-        sleep 2
-    else
-        clear
-        figlet -k volt-udp |
-            awk '{gsub(/./,"\033[3"int(rand()*5+1)"m&\033[0m")}1' &&
-        figlet -k hysteria |
-            awk '{gsub(/./,"\033[3"int(rand()*5+1)"m&\033[0m")}1'
-        echo "${T_RED} ⇢ การตรวจสอบไม่สำเร็จ ยกเลิกการติดตั้ง${T_RESET}"
-        exit 1
-    fi
+
+menu_expire() {
+  line; msg "⏰ ตั้ง/แก้ไขวันหมดอายุ"
+  [[ "$(count_users)" -eq 0 ]] && { warn "ยังไม่มีผู้ใช้"; pause; return; }
+  list_simple
+  local u="$(input_required "เลือก User: ")"
+  user_exists "$u" || { fail "ไม่พบ [$u]"; pause; return; }
+  local old="$(get_user_field "$u" 4)"; [[ "$old" == "0000-00-00" ]] && old="ไม่มีกำหนด"
+  echo "   หมดอายุปัจจุบัน: $old"
+  echo "   💡 เช่น +30 วัน = $(date -d '+30 days' +%Y-%m-%d)  |  +1 ปี = $(date -d '+1 year' +%Y-%m-%d)"
+  local exp
+  while :; do
+    read -rp "   วันใหม่ (YYYY-MM-DD / 0 = ไม่หมด): " exp
+    exp="${exp:-0}"
+    [[ "$exp" == "0" ]] && { exp="0000-00-00"; break; }
+    valid_date "$exp" && break || fail "รูปแบบผิด"
+  done
+  set_user_field "$u" 4 "$exp"
+  [[ "$exp" == "0000-00-00" ]] && ok "ตั้งเป็นไม่หมดอายุ" || ok "ตั้งหมดอายุ = $exp"
+  read -rp "นำไปใช้งานทันที? (Y/n): " a
+  [[ "${a,,}" != "n" ]] && apply_changes
+  pause
 }
-client_config() {
-    clear
-    echo ""
-    echo "=============================================="
-    echo "       Hysteria 2 Client Configuration"
-    echo "=============================================="
-    echo ""
-    mkdir -p /etc/hysteria/client
-    python3 <<'PY'
-import sys
-import os
-sys.path.insert(
-    0,
-    "/etc/volt"
-)
-import auth
-data = auth.load_config()
-domain = data["server"].get(
-    "domain",
-    ""
-)
-ip = data["server"].get(
-    "ip",
-    ""
-)
-port = data["server"].get(
-    "port",
-    36712
-)
-port_hopping = data["server"].get(
-    "port_hopping",
-    "10000-65000"
-)
-obfs = data["server"].get(
-    "obfs",
-    ""
-)
-users = auth.get_users()
-print()
-print("----------------------------------------------")
-print(" Hysteria 2 Client Configuration")
-print("----------------------------------------------")
-print()
-print("Domain :", domain)
-print("IP     :", ip)
-print("Port   :", port)
-print("Hopping:", port_hopping)
-print()
-if not users:
-    print("ยังไม่มี User")
-else:
-    for user in users:
-        username = user["username"]
-        print(
-            "Username :",
-            username
-        )
-        print(
-            "Password :",
-            user["password"]
-        )
-        try:
-            print(
-                "URI      :",
-                auth.build_uri(username)
-            )
-        except Exception as e:
-            print(
-                "URI      : ERROR",
-                e
-            )
-        print(
-            "----------------------------------------------"
-        )
-# สร้างไฟล์ข้อมูลรวม
-info_path = (
-    "/etc/hysteria/client/info.txt"
-)
-with open(
-    info_path,
-    "w",
-    encoding="utf-8"
-) as f:
-    f.write(
-        "Voltssh-X Hysteria 2 Client Configuration\n"
-    )
-    f.write(
-        f"Domain: {domain}\n"
-    )
-    f.write(
-        f"IP: {ip}\n"
-    )
-    f.write(
-        f"Server Port: {port}\n"
-    )
-    f.write(
-        f"Port Hopping: {port_hopping}\n\n"
-    )
-    for user in users:
-        username = user["username"]
-        f.write(
-            f"Username: {username}\n"
-        )
-        f.write(
-            f"Password: {user['password']}\n"
-        )
-        try:
-            f.write(
-                f"URI: {auth.build_uri(username)}\n"
-            )
-        except Exception:
-            pass
-        f.write(
-            "\n"
-        )
-os.chmod(
-    info_path,
-    0o600
-)
-PY
-    echo ""
-    echo "ไฟล์ Client Configuration:"
-    echo ""
-    echo "/etc/hysteria/client/info.txt"
-    echo ""
-    echo "จัดการ User:"
-    echo ""
-    echo "  volt-user"
-    echo ""
+
+
+### ============================================================
+### 🚀 ติดตั้ง / ถอน / อัปเดต / สถานะ (ปรับจาก install_server.sh)
+### ============================================================
+get_running_services() {
+  [[ "x$FORCE_NO_SYSTEMD" == "x2" ]] && return
+  systemctl list-units --state=active --plain --no-legend 2>/dev/null \
+    | grep -o "hysteria-server@*[^\s]*.service" || true
 }
-reload_service() {
-    echo "กำลังรีสตาร์ทบริการ Hysteria..."
-    systemctl restart hysteria
-    systemctl restart systemd-journald
+restart_running() {
+  [[ "x$FORCE_NO_SYSTEMD" == "x2" ]] && return
+  for s in $(get_running_services); do
+    echo -n "รีสตาร์ท $s ... "
+    systemctl restart "$s" && echo "เสร็จ" || echo "ผิดพลาด"
+  done
 }
+stop_running() {
+  [[ "x$FORCE_NO_SYSTEMD" == "x2" ]] && return
+  for s in $(get_running_services); do
+    echo -n "หยุด $s ... "
+    systemctl stop "$s" && echo "เสร็จ" || echo "ผิดพลาด"
+  done
+}
+
+perform_install_binary() {
+  if [[ -n "$LOCAL_FILE" ]]; then
+    note "ติดตั้งจากไฟล์: $LOCAL_FILE"
+    install -Dm755 "$LOCAL_FILE" "$EXECUTABLE_INSTALL_PATH" && ok "ติดตั้ง binary เสร็จ" || exit 2
+    return
+  fi
+  local tmp="$(mktemp)"
+  download_hysteria "$VERSION" "$tmp" || { rm -f "$tmp"; exit 11; }
+  install -Dm755 "$tmp" "$EXECUTABLE_INSTALL_PATH" && ok "ติดตั้ง Hysteria $VERSION เสร็จ" || exit 13
+  rm -f "$tmp"
+}
+
+menu_install() {
+  line; msg "1️⃣  ติดตั้ง / อัปเดต Hysteria 2"
+  check_permission; check_environment
+  check_hysteria_user "hysteria"
+  check_hysteria_homedir "/var/lib/$HYSTERIA_USER"
+  if [[ -z "$SECONTEXT_SYSTEMD_UNIT" && -z "$FORCE_NO_SELINUX" ]] && has_command getenforce; then
+    note "ตรวจพบ SELinux"
+    [[ -e "$SYSTEMD_SERVICES_DIR" ]] && SECONTEXT_SYSTEMD_UNIT="$(get_selinux_context "$SYSTEMD_SERVICES_DIR")"
+    [[ -z "$SECONTEXT_SYSTEMD_UNIT" ]] && warn "อ่าน SELinux context ไม่ได้"
+  fi
+
+  local fresh=0 up1=0 need=0
+  if ! is_hysteria_installed; then fresh=1
+  elif is_hysteria1_version "$(get_installed_version)"; then up1=1; fi
+
+  if [[ -n "$LOCAL_FILE" || -n "$VERSION" ]] || check_update; then need=1; fi
+  [[ "x$FORCE" == "x1" ]] && need=1
+
+  if is_hysteria1_version "$VERSION"; then error "ติดตั้งได้แค่ Hysteria 2"; exit 95; fi
+  [[ "$need" -eq 1 ]] && perform_install_binary
+
+  if ! is_user_exists "$HYSTERIA_USER"; then
+    echo -n "สร้าง user $HYSTERIA_USER ... "
+    useradd -r -d "$HYSTERIA_HOME_DIR" -m -s /usr/sbin/nologin "$HYSTERIA_USER" 2>/dev/null && echo "OK" || echo "ข้าม"
+  fi
+
+  build_all_configs
+  has_command apt && apt install -y grepcidr >/dev/null 2>&1 && ok "ติดตั้ง grepcidr (รองรับ CIDR)" || true
+
+  line
+  if [[ "$fresh" -eq 1 ]]; then
+    msg "🎉 ติดตั้งเสร็จสมบูรณ์!"
+    echo "   1) แก้ $CONFIG_FILE ใส่โดเมน+อีเมล ACME"
+    echo "   2) DNS ชี้ไปที่ VPS นี้ + เปิด UDP 443"
+    echo "   3) กลับเมนู → 4 เพิ่มผู้ใช้"
+    echo "   4) systemctl enable --now hysteria-server"
+  elif [[ "$up1" -eq 1 ]]; then
+    warn "อัปเกรดจาก v1 → v2 (โปรโตคอลไม่เข้ากัน ต้องสร้างผู้ใช้ใหม่)"
+  else
+    msg "✅ อัปเดตเป็น $VERSION เสร็จ"
+    restart_running
+  fi
+  pause
+}
+
+menu_remove() {
+  line; msg "2️⃣  ถอนการติดตั้งทั้งหมด"
+  read -rp "   ⚠ พิมพ์ DELETE เพื่อยืนยันลบทุกอย่าง: " ans
+  [[ "$ans" != "DELETE" ]] && { warn "ยกเลิก"; pause; return; }
+  stop_running
+  systemctl disable hysteria-server.service >/dev/null 2>&1 || true
+  rm -f "$EXECUTABLE_INSTALL_PATH"
+  rm -f "$SYSTEMD_SERVICES_DIR"/hysteria-server*.service
+  rm -f "$CRON_FILE"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  read -rp "   ลบ config + ผู้ใช้ทั้งหมดด้วย? (y/N): " a
+  [[ "${a,,}" == "y" ]] && rm -rf "$CONFIG_DIR" && ok "ลบ $CONFIG_DIR เสร็จ"
+  read -rp "   ลบ user $HYSTERIA_USER ด้วย? (y/N): " a
+  [[ "${a,,}" == "y" && "$HYSTERIA_USER" != "root" ]] && userdel -r "$HYSTERIA_USER" 2>/dev/null && ok "ลบ user เสร็จ"
+  ok "ถอนการติดตั้งเสร็จ"; pause
+}
+
+menu_check() {
+  line; msg "3️⃣  ตรวจสอบเวอร์ชัน"
+  check_permission; check_environment
+  if check_update; then
+    msg "💡 มีเวอร์ชันใหม่!"
+    read -rp "   อัปเดตตอนนี้? (Y/n): " a
+    [[ "${a,,}" != "n" ]] && { FORCE=1 perform_install_binary; apply_changes; }
+  else ok "เป็นเวอร์ชันล่าสุดแล้ว ✅"; fi
+  pause
+}
+
+menu_status() {
+  line; msg "📊 สถานะบริการ"
+  is_hysteria_installed || { warn "ยังไม่ติดตั้ง → เมนู 1"; pause; return; }
+  echo "   เวอร์ชัน       : $(get_installed_version)"
+  echo "   ผู้ใช้ทั้งหมด : $(count_users) คน"
+  echo -n "   สถานะ         : "
+  if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+    echo "$(tgreen)กำลังทำงาน ✅$(treset)"
+    echo -n "   เปิดอัตโนมัติ : "
+    systemctl is-enabled --quiet hysteria-server 2>/dev/null && echo "$(tgreen)เปิด$(treset)" || echo "$(tyellow)ยังไม่เปิด$(treset)"
+    echo; msg "Log ล่าสุด (10 บรรทัด):"
+    journalctl -u hysteria-server -n 10 --no-pager 2>/dev/null || warn "ดู log ไม่ได้"
+  else
+    echo "$(tred)หยุด ❌$(treset)  →  systemctl enable --now hysteria-server"
+  fi
+  pause
+}
+
+
+### ============================================================
+### 🧭 เมนูหลัก & ตัวแยกวิเคราะห์
+### ============================================================
+show_main_menu() {
+  clear
+  echo
+  msg "╔══════════════════════════════════════════╗"
+  msg "║   🚀 Hysteria 2 Manager (ภาษาไทย)        ║"
+  msg "╚══════════════════════════════════════════╝"
+  echo
+  echo "   $(tblue)0$(treset) 📖 คู่มือ / ช่วยเหลือ"
+  echo "   $(tblue)1$(treset) 🟢 ติดตั้ง / อัปเดต Hysteria 2"
+  echo "   $(tblue)2$(treset) 🔴 ถอนการติดตั้ง"
+  echo "   $(tblue)3$(treset) 🔍 ตรวจสอบเวอร์ชันอัปเดต"
+  echo
+  echo "   ─────────── 🧑‍🤝‍🧑 จัดการผู้ใช้ ───────────"
+  echo "   $(tgreen)4$(treset) ➕ เพิ่มผู้ใช้ (รหัสผ่าน + IP + หมดอายุ)"
+  echo "   $(tgreen)5$(treset) ➖ ลบผู้ใช้"
+  echo "   $(tgreen)6$(treset) 📋 แสดงรายชื่อทั้งหมด"
+  echo "   $(tgreen)7$(treset) 🌐 จำกัด IP ต่อผู้ใช้"
+  echo "   $(tgreen)8$(treset) ⏰ ตั้ง/แก้ไขวันหมดอายุ"
+  echo
+  echo "   ───────────── ⚙️ อื่นๆ ─────────────────"
+  echo "   $(taoi)9$(treset)  ♻️ บันทึกการเปลี่ยนแปลง + รีสตาร์ท"
+  echo "   $(taoi)10$(treset) 📊 สถานะบริการ & Log"
+  echo "   $(tred)00$(treset) 🚪 ออกจากโปรแกรม"
+  echo; line
+}
+
+main_menu() {
+  check_permission; check_environment
+  check_hysteria_user "hysteria"
+  check_hysteria_homedir "/var/lib/$HYSTERIA_USER"
+  init_user_db
+  while :; do
+    show_main_menu
+    read -rp "   เลือก [0-10 / 00=ออก]: " c
+    case "$c" in
+      0)  show_help ;;
+      1)  menu_install ;;
+      2)  menu_remove ;;
+      3)  menu_check ;;
+      4)  menu_add ;;
+      5)  menu_del ;;
+      6)  menu_list ;;
+      7)  menu_ip ;;
+      8)  menu_expire ;;
+      9)  apply_changes; pause ;;
+      10) menu_status ;;
+      00|q|Q|exit) msg "👋 ลาก่อน!"; exit 0 ;;
+      *) fail "เลือกไม่ถูกต้อง"; sleep 1.2 ;;
+    esac
+  done
+}
+
+parse_arguments() {
+  [[ $# -eq 0 ]] && { main_menu; exit 0; }
+  case "$1" in
+    -h|--help|help)     show_help ;;
+    install)            OPERATION=install ;;
+    remove|uninstall)   OPERATION=remove ;;
+    check|update)       OPERATION=check ;;
+    add|adduser)        OPERATION=add ;;
+    del|rm|delete)      OPERATION=del ;;
+    list|ls|users)      OPERATION=list ;;
+    ip)                 OPERATION=ip ;;
+    expire|date)        OPERATION=expire ;;
+    apply|reload)       OPERATION=apply ;;
+    status|info)        OPERATION=status ;;
+    -f|--force)         FORCE=1; shift; parse_arguments "$@" ;;
+    --version)          VERSION="$2"; shift 2; parse_arguments "$@" ;;
+    -l|--local)         LOCAL_FILE="$2"; shift 2; parse_arguments "$@" ;;
+    *) error "คำสั่ง '$1' ไม่รู้จัก → $SCRIPT_NAME --help"; exit 22 ;;
+  esac
+}
+
 main() {
-    clear
-    checkRoot
-    script_header
-    update_packages
-    banner
-    verification
-    client_config
-    reload_service
-    echo "${T_GREEN}ติดตั้ง Voltssh-X Hysteria Server เสร็จสมบูรณ์!${T_RESET}"
-    echo "${T_YELLOW}พิมพ์คำว่า \"volt\" เพื่อเข้าสู่เมนูจัดการ${T_RESET}"
-    echo ""
-    echo ""
-    read -p " ⇢  กดปุ่มใดก็ได้เพื่อออก ↩︎" key
+  parse_arguments "$@"
+  check_permission; check_environment
+  check_hysteria_user "hysteria"
+  check_hysteria_homedir "/var/lib/$HYSTERIA_USER"
+  init_user_db
+  case "$OPERATION" in
+    install) menu_install ;;
+    remove)  menu_remove ;;
+    check)   menu_check ;;
+    add)     menu_add ;;
+    del)     menu_del ;;
+    list)    menu_list ;;
+    ip)      menu_ip ;;
+    expire)  menu_expire ;;
+    apply)   apply_changes ;;
+    status)  menu_status ;;
+  esac
 }
-main
+
+main "$@"
